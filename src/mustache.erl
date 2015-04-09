@@ -41,6 +41,7 @@
 compile(Body) when is_list(Body) ->
   State = #mstate{},
   CompiledTemplate = pre_compile(Body, State),
+  ?debugFmt("CompiledTemplate: ~p~n", [CompiledTemplate]),
   % io:format("~p~n~n", [CompiledTemplate]),
   % io:format(CompiledTemplate ++ "~n", []),
   {ok, Tokens, _} = erl_scan:string(CompiledTemplate),
@@ -124,6 +125,8 @@ compile_section("#", Name, Content, State) ->
       "\"false\" -> []; " ++
       "List when is_list(List) -> " ++
         "[fun(Ctx) -> " ++ Result ++ " end(" ++ ?MUSTACHE_CTX_STR ++ ":merge(SubCtx, Ctx)) || SubCtx <- List]; " ++
+      "Map when is_map(Map) -> " ++
+        "fun(Ctx) -> " ++ Result ++ " end(Map);"
       "Fun when is_function(Fun, 1) -> " ++
         "Fun(" ++ Result ++ ");"
       "Else -> " ++
@@ -145,15 +148,16 @@ compile_section("^", Name, Content, State) ->
 compile_tags(T, State0) ->
   Res = re:run(T, State0#mstate.tag_re),
   case Res of
-    {match, [{M0, M1}, K, {C0, C1}]} ->
+    {match, [{M0, M1}, K, {C0, C1} | _Rest]} ->
       Front = string:substr(T, 1, M0),
       Back = string:substr(T, M0 + M1 + 1),
       Content = string:substr(T, C0 + 1, C1),
+      ?debugVal(Content),
       Kind = tag_kind(T, K),
       {Result, State1} = compile_tag(Kind, Content, State0),
       "[\"" ++ escape_special(Front) ++
         "\" | [" ++ Result ++
-        " | " ++ compile_tags(Back, State1) ++ "]]";
+        " | " ++ compiler(Back, State1) ++ "]]";
     nomatch ->
       "[\"" ++ escape_special(T) ++ "\"]"
   end.
@@ -265,7 +269,7 @@ section_re(Left0, Right0) ->
 
 tag_re(Left0, Right0) ->
     {Left1, Right1} = {escape_delimiter(Left0), escape_delimiter(Right0)},
-    Regexp = [Left1, "(#|=|!|<|>|{|&)?(.+?)\\1?", Right1, "+"],
+    Regexp = [Left1, "(#|=|!|>|{|&)?(.+?)(=|})?", Right1],
     re:compile(Regexp, [dotall]).
 
 escape_delimiter(Delimiter) ->

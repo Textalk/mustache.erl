@@ -42,6 +42,10 @@ ctx_to_list_with_module_test() ->
     CtxList = mustache_ctx:to_list(Ctx1),
     ?assertEqual([], CtxList).
 
+get_binary_key_test() ->
+    Ctx = mustache_ctx:new([{<<"test">>, value}]),
+    ?assertEqual({ok, value}, mustache_ctx:get([test], Ctx)).
+
 get_from_empty_test() ->
     Ctx = mustache_ctx:new(),
     ?assertEqual({error, not_found}, mustache_ctx:get([key], Ctx)).

@@ -105,8 +105,12 @@ get_path([], Value) ->
     {ok, Value};
 get_path([Key | Keys], Map) ->
     case maps:find(Key, Map) of
-        {ok, Value} -> get_path(Keys, Value);
-        error       -> error
+        {ok, Value} ->
+            get_path(Keys, Value);
+        error when is_atom(Key) ->
+            get_path([atom_to_binary(Key, utf8) | Keys], Map);
+        error when is_binary(Key) ->
+            error
     end.
 
 get_from_module([Key | Rest], Ctx) ->

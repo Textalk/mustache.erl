@@ -62,6 +62,11 @@ complex_section_dot_test() ->
     Result = mustache:render(<<"{{#test1.test2}}{{.}}{{/test1.test2}}">>, Ctx),
     ?assertEqual(<<"123">>, Result).
 
+object_section_test() ->
+    Ctx = #{test => #{name => <<"Emil">>}},
+    Result = mustache:render(<<"{{#test}}{{name}}{{/test}}">>, Ctx),
+    ?assertEqual(<<"Emil">>, Result).
+
 fun_test() ->
     Ctx = #{test1 => fun (Text) -> re:replace(Text, "xxx", "yyy") end,
             test2 => "xxx"},
@@ -70,7 +75,7 @@ fun_test() ->
 
 set_delimiter_test() ->
     Ctx = #{test1 => <<"TEST1">>, test2 => <<"TEST2">>},
-    Result = mustache:render(<<"{{=[[ ]]=}}[[test1]] [[={{ }}=]]{{test2}}">>, Ctx),
+    Result = mustache:render(<<"{{=[[ ]]=}}[[{test1}]] [[={{ }}=]]{{{test2}}}">>, Ctx),
     ?assertEqual(<<"TEST1 TEST2">>, Result).
 
 %% ===================================================================
