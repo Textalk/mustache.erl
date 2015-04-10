@@ -78,6 +78,11 @@ set_delimiter_test() ->
     Result = mustache:render(<<"{{=[[ ]]=}}[[{test1}]] [[={{ }}=]]{{{test2}}}">>, Ctx),
     ?assertEqual(<<"TEST1 TEST2">>, Result).
 
+set_delimiter_boolean_section_test() ->
+    Ctx = #{test1 => #{test2 => true}},
+    Result = mustache:render(<<"{{=[[ ]]=}}[[#test1.test2]]TEST[[/test1.test2]] {{::test}}">>, Ctx),
+    ?assertEqual(<<"TEST {{::test}}">>, Result).
+
 %% ===================================================================
 %% basic tag types
 %% ===================================================================

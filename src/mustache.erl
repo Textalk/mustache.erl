@@ -27,10 +27,12 @@
 -author("Tom Preston-Werner").
 -export([compile/1, compile/2, render/1, render/2, render/3, get/2, get/3, escape/1, start/1]).
 
--record(mstate, {mod = undefined,
-                 section_re = undefined,
-                 tag_re = undefined,
-                 path = []}).
+-record(mstate, {
+          depth = 0,
+          mod = undefined,
+          section_re = undefined,
+          tag_re = undefined
+         }).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -41,7 +43,7 @@
 compile(Body) when is_list(Body) ->
   State = #mstate{},
   CompiledTemplate = pre_compile(Body, State),
-  ?debugFmt("CompiledTemplate: ~p~n", [CompiledTemplate]),
+  %?debugVal(CompiledTemplate),
   % io:format("~p~n~n", [CompiledTemplate]),
   % io:format(CompiledTemplate ++ "~n", []),
   {ok, Tokens, _} = erl_scan:string(CompiledTemplate),
@@ -82,6 +84,8 @@ render(Body, Ctx) when is_binary(Body) ->
     unicode:characters_to_binary(render(undefined, TFun, Ctx));
 render(Mod, File) when is_list(File) ->
   render(Mod, File, []);
+render(CompiledTemplate, Ctx) when is_function(CompiledTemplate, 1) ->
+    render(undefined, CompiledTemplate, Ctx);
 render(Mod, CompiledTemplate) ->
   render(Mod, CompiledTemplate, []).
 
@@ -108,6 +112,7 @@ compiler(T, State) ->
       Kind = string:substr(T, K0 + 1, K1),
       Name = string:substr(T, N0 + 1, N1),
       Content = string:substr(T, C0 + 1, C1),
+      %?debugFmt("String: ~p~nFront: ~p~nBack: ~p~nKind: ~p~nName: ~p~nContent: ~p~n~n", [T, Front, Back, Kind, Name, Content]),
       "[" ++ compile_tags(Front, State) ++
         " | [" ++ compile_section(Kind, Name, Content, State) ++
         " | [" ++ compiler(Back, State) ++ "]]]";
@@ -115,22 +120,24 @@ compiler(T, State) ->
       compile_tags(T, State)
   end.
 
-compile_section("#", Name, Content, State) ->
-  Mod = State#mstate.mod,
+compile_section("#", Name, Content, State0) ->
+  #mstate{mod = Mod, depth = Depth} = State0,
   Key = compile_dot_notation(Name),
-  Result = compiler(Content, add_section_path(Key, State)),
+  State1 = State0#mstate{depth = Depth + 1},
+  Result = compiler(Content, State1),
+  Var = "Var" ++ integer_to_list(Depth),
   "fun() -> " ++
     "case " ++ ?MUSTACHE_STR ++ ":get(" ++ Key ++ ", Ctx, " ++ atom_to_list(Mod) ++ ") of " ++
       "\"true\" -> " ++ Result ++ "; " ++
       "\"false\" -> []; " ++
-      "List when is_list(List) -> " ++
-        "[fun(Ctx) -> " ++ Result ++ " end(" ++ ?MUSTACHE_CTX_STR ++ ":merge(SubCtx, Ctx)) || SubCtx <- List]; " ++
-      "Map when is_map(Map) -> " ++
-        "fun(Ctx) -> " ++ Result ++ " end(Map);"
-      "Fun when is_function(Fun, 1) -> " ++
-        "Fun(" ++ Result ++ ");"
-      "Else -> " ++
-        "throw({template, io_lib:format(\"Bad context for ~p: ~p\", [\"" ++ Name ++ "\", Else])}) " ++
+      Var ++ " when is_list(" ++ Var ++ ") -> " ++
+        "[fun(Ctx) -> " ++ Result ++ " end(" ++ ?MUSTACHE_CTX_STR ++ ":merge(SubCtx, Ctx)) || SubCtx <- " ++ Var ++ "]; " ++
+      Var ++ " when is_map(" ++ Var ++ ") -> " ++
+        "fun(Ctx) -> " ++ Result ++ " end(" ++ Var ++ ");" ++
+      Var ++ " when is_function(" ++ Var ++ ", 1) -> " ++
+        Var ++"(" ++ Result ++ ");" ++
+      Var ++ " -> " ++
+        "throw({template, io_lib:format(\"Bad context for ~p: ~p\", [\"" ++ Name ++ "\", " ++ Var ++ "])}) " ++
     "end " ++
   "end()";
 compile_section("^", Name, Content, State) ->
@@ -152,7 +159,6 @@ compile_tags(T, State0) ->
       Front = string:substr(T, 1, M0),
       Back = string:substr(T, M0 + M1 + 1),
       Content = string:substr(T, C0 + 1, C1),
-      ?debugVal(Content),
       Kind = tag_kind(T, K),
       {Result, State1} = compile_tag(Kind, Content, State0),
       "[\"" ++ escape_special(Front) ++
@@ -264,19 +270,16 @@ set_delimiters(Left, Right, State) ->
 section_re(Left0, Right0) ->
     {Left1, Right1} = {escape_delimiter(Left0), escape_delimiter(Right0)},
     Stop = ["([^", hd(Right0), "]*)"],
-    Regexp = [Left1, "(#|\\^)", Stop, Right1, "\\s*(.+?)", Left1, "/\\2", Right1, "\\s*"],
-    re:compile(Regexp, [dotall]).
+    Regexp = [Left1, "(#|\\^)", Stop, Right1, "\\s*(.+?)", Left1, "/\\2", Right1],
+    re:compile(Regexp, [dotall, unicode]).
 
 tag_re(Left0, Right0) ->
     {Left1, Right1} = {escape_delimiter(Left0), escape_delimiter(Right0)},
     Regexp = [Left1, "(#|=|!|>|{|&)?(.+?)(=|})?", Right1],
-    re:compile(Regexp, [dotall]).
+    re:compile(Regexp, [dotall, unicode]).
 
 escape_delimiter(Delimiter) ->
     lists:map(fun (Char) -> [$\\, Char] end, Delimiter).
-
-add_section_path(Key, #mstate{path = Path} = State) ->
-    State#mstate{path = Path ++ Key}.
 
 %%---------------------------------------------------------------------------
 
