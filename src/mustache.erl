@@ -23,271 +23,167 @@
 %% See the README at http://github.com/mojombo/mustache.erl for additional
 %% documentation and usage examples.
 
--module(mustache).  %% v0.1.0
+-module(mustache).
 -author("Tom Preston-Werner").
--export([compile/1, compile/2, render/1, render/2, render/3, get/2, get/3, escape/1, start/1]).
+-export([compile/1, render/2]).
 
--record(mstate, {
-          depth = 0,
-          mod = undefined,
-          section_re = undefined,
-          tag_re = undefined
+-record(state, {
+          this,
+          context = #{},
+          section_re,
+          tag_re
          }).
 
 -include_lib("eunit/include/eunit.hrl").
 
--define(MUSTACHE_CTX, mustache_ctx).
--define(MUSTACHE_CTX_STR, "mustache_ctx").
--define(MUSTACHE_STR, "mustache").
+compile(Template) when is_binary(Template) ->
+    fun(Context) -> sections(Template, set_delimiters(<<"{{ }}">>, #state{context = Context})) end;
+compile(Template) when is_list(Template) ->
+    compile(unicode:characters_to_binary(Template)).
 
-compile(Body) when is_binary(Body) ->
-  State = #mstate{},
-  CompiledTemplate = pre_compile(Body, State),
-  %io:format("~p~n~n", [CompiledTemplate]),
-  {ok, Tokens, _} = erl_scan:string(CompiledTemplate),
-  {ok, [Form]} = erl_parse:parse_exprs(Tokens),
-  Bindings = erl_eval:new_bindings(),
-  {value, Fun, _} = erl_eval:expr(Form, Bindings),
-  Fun;
-compile(Body) when is_list(Body) ->
-    compile(unicode:characters_to_binary(Body));
-compile(Mod) when is_atom(Mod) ->
-  TemplatePath = template_path(Mod),
-  compile(Mod, TemplatePath).
+render(Template, Context) when (is_list(Template) orelse is_binary(Template)) andalso is_map(Context) ->
+    Render = compile(Template),
+    Render(Context);
+render(Render, Context) when is_function(Render, 1), is_map(Context) ->
+    Render(Context).
 
-compile(Mod, File) ->
-  code:purge(Mod),
-  {module, _} = code:load_file(Mod),
-  {ok, TemplateBin} = file:read_file(File),
-  Template = re:replace(TemplateBin, "\"", "\\\\\"", [global, {return,list}]),
-  State = #mstate{mod = Mod},
-  CompiledTemplate = pre_compile(Template, State),
-  % io:format("~p~n~n", [CompiledTemplate]),
-  % io:format(CompiledTemplate ++ "~n", []),
-  {ok, Tokens, _} = erl_scan:string(CompiledTemplate),
-  {ok, [Form]} = erl_parse:parse_exprs(Tokens),
-  Bindings = erl_eval:new_bindings(),
-  {value, Fun, _} = erl_eval:expr(Form, Bindings),
-  Fun.
+sections(<<>>, _State) ->
+    [];
+sections(Template, #state{section_re = SectionRE} = State) ->
+    case re:run(Template, SectionRE) of
+        {match, [{M0, M1}, {K0, K1}, {N0, N1}, {C0, C1}]} ->
+            Front = erlang:binary_part(Template, 0, M0),
+            End = M0 + M1,
+            Rest = erlang:binary_part(Template, End, byte_size(Template) - End),
+            Kind = erlang:binary_part(Template, K0, K1),
+            Name = erlang:binary_part(Template, N0, N1),
+            Content = erlang:binary_part(Template, C0, C1),
+            [tags(Front, State),
+             section(Kind, Name, Content, State),
+             sections(Rest, State)];
+        nomatch ->
+            tags(Template, State)
+    end.
 
-render(Mod) ->
-  TemplatePath = template_path(Mod),
-  render(Mod, TemplatePath).
+section(<<"#">>, Name, Content, State) ->
+    case get(Name, State) of
+        undefined ->
+            [];
+        {ok, Value} ->
+            case Value of
+                False when False =:= false; False =:= [] ->
+                    [];
+                [Context | _] = SubContexts when is_map(Context) ->
+                    [sections(Content, State#state{context = SubContext}) || SubContext <- SubContexts];
+                List when is_list(List) ->
+                    [sections(Content, State#state{this = Item}) || Item <- List];
+                SubContext when is_map(SubContext) ->
+                    sections(Content, State#state{context = SubContext});
+                Fun when is_function(Fun, 1) ->
+                    Fun(sections(Content, State));
+                _Other ->
+                    sections(Content, State)
+            end
+    end;
+section(<<"^">>, Name, Content, State) ->
+    case get(Name, State) of
+        undefined -> sections(Content, State);
+        {ok, False} when False =:= false; False =:= [] -> sections(Content, State);
+        {ok, _Other} -> []
+    end.
 
-render(Body, Ctx) when is_list(Body) ->
-  TFun = compile(Body),
-  render(undefined, TFun, Ctx);
-render(Body, Ctx) when is_binary(Body) ->
-    TFun = compile(Body),
-    unicode:characters_to_binary(render(undefined, TFun, Ctx));
-render(Mod, File) when is_list(File) ->
-  render(Mod, File, []);
-render(CompiledTemplate, Ctx) when is_function(CompiledTemplate, 1) ->
-    render(undefined, CompiledTemplate, Ctx);
-render(Mod, CompiledTemplate) ->
-  render(Mod, CompiledTemplate, []).
-
-render(Mod, File, Ctx) when is_list(File) ->
-  CompiledTemplate = compile(Mod, File),
-  render(Mod, CompiledTemplate, Ctx);
-render(Mod, CompiledTemplate, CtxData) ->
-  Ctx0 = ?MUSTACHE_CTX:new(CtxData),
-  Ctx1 = ?MUSTACHE_CTX:module(Mod, Ctx0),
-  lists:flatten(CompiledTemplate(Ctx1)).
-
-pre_compile(Template, State0) ->
-  State1 = set_delimiters(<<"{{ }}">>, State0),
-  unicode:characters_to_list([<<"fun(Ctx) -> ">>, compiler(Template, State1), <<" end.">>]).
-
-compiler(Template, State) ->
-  Res = re:run(Template, State#mstate.section_re),
-  case Res of
-    {match, [{M0, M1}, {K0, K1}, {N0, N1}, {C0, C1}]} ->
-      Front = erlang:binary_part(Template, 0, M0),
-      End = M0 + M1,
-      Back = erlang:binary_part(Template, End, byte_size(Template) - End),
-      Kind = erlang:binary_part(Template, K0, K1),
-      Name = erlang:binary_part(Template, N0, N1),
-      Content = erlang:binary_part(Template, C0, C1),
-      [<<"[">>, compile_tags(Front, State),
-       <<" | [">>, compile_section(Kind, Name, Content, State),
-       <<" | [">>, compiler(Back, State), <<"]]]">>];
-    nomatch ->
-      compile_tags(Template, State)
-  end.
-
-compile_section(<<"#">>, Name, Content, State0) ->
-  #mstate{mod = Mod, depth = Depth} = State0,
-  ModBin = atom_to_binary(Mod, utf8),
-  KeyBin = compile_dot_notation(Name),
-  State1 = State0#mstate{depth = Depth + 1},
-  Result = compiler(Content, State1),
-  Var = ["Var", integer_to_binary(Depth)],
-  [<<"fun() -> "
-         "case mustache:get(">>, KeyBin, <<", Ctx, ">>, ModBin,  <<") of "
-             "<<\"true\">> -> ">>, Result, <<"; "
-             "<<\"false\">> -> []; ">>,
-              Var, <<" when is_binary(">>, Var, <<") -> ">>,
-                 Var, <<";">>,
-              Var, <<" when is_list(">>, Var, <<") -> "
-                 "[fun(Ctx) -> ">>, Result, <<" end(mustache_ctx:merge(SubCtx, Ctx)) || SubCtx <- ">>, Var, <<"]; ">>,
-              Var, <<" when is_map(">>, Var, <<") -> "
-                 "fun(Ctx) -> ">>, Result, <<" end(">>, Var, <<");">>,
-              Var, <<" when is_function(">>, Var ,<<", 1) -> ">>,
-                  Var, <<"(">>, Result, <<");">>,
-              Var, <<" -> ">>,
-               <<"throw({template, io_lib:format(\"Bad context for ~p: ~p\", [\"">>, Name, <<"\", ">>, Var, <<"])}) "
-    "end "
-  "end()">>];
-compile_section(<<"^">>, Name, Content, State) ->
-  ModBin = atom_to_binary(State#mstate.mod, utf8),
-  KeyBin = compile_dot_notation(Name),
-  Result = compiler(Content, State),
-  [<<"fun() -> "
-         "case mustache:get(">>, KeyBin, <<", Ctx, ">>, ModBin, <<") of "
-             "<<\"false\">> -> ">>, Result, <<"; "
-             "[] -> ">>, Result, <<"; "
-             "_ -> [] "
-         "end "
-     "end()">>].
-
-compile_tags(Template, State0) ->
-  Res = re:run(Template, State0#mstate.tag_re),
-  case Res of
-    {match, [{M0, M1}, K, {C0, C1} | _Rest]} ->
-      Front = erlang:binary_part(Template, 0, M0),
-      End = M0 + M1,
-      Back = erlang:binary_part(Template, End, byte_size(Template) - End),
-      Content = erlang:binary_part(Template, C0, C1),
-      Kind = tag_kind(Template, K),
-      {Result, State1} = compile_tag(Kind, Content, State0),
-      Rest = case Kind of
-                 <<"=">> -> compiler(Back, State1);
-                 _ -> compile_tags(Back, State1)
+tags(Template, #state{tag_re = TagRE} = State0) ->
+    case re:run(Template, TagRE) of
+        {match, [{M0, M1}, K, {C0, C1} | _Rest]} ->
+            Front = erlang:binary_part(Template, 0, M0),
+            End = M0 + M1,
+            Back = erlang:binary_part(Template, End, byte_size(Template) - End),
+            Content = erlang:binary_part(Template, C0, C1),
+            Kind = kind(Template, K),
+            {Result, State1} = tag(Kind, Content, State0),
+            Rest = case Kind of
+                 <<"=">> -> sections(Back, State1);
+                 _       -> tags(Back, State1)
              end,
-      [<<"[<<\"">>, escape_special(Front), <<"\">>,">>, Result, <<",">>, Rest, <<"]">>];
-    nomatch ->
-      [<<"<<\"">>, escape_special(Template), <<"\">>">>]
-  end.
+            [Front, Result, Rest];
+        nomatch ->
+            Template
+    end.
 
-tag_kind(_Template, {-1, 0}) ->
-  none;
-tag_kind(Template, {K0, K1}) ->
-    erlang:binary_part(Template, K0, K1).
+kind(_Template, {-1, 0}) -> none;
+kind(Template, {K0, K1}) -> erlang:binary_part(Template, K0, K1).
 
-compile_tag(none, Content, State) ->
-  {compile_escaped_tag(Content, State), State};
-compile_tag(<<"&">>, Content, State) ->
-  {compile_unescaped_tag(Content, State), State};
-compile_tag(<<"{">>, Content, State) ->
-  {compile_unescaped_tag(Content, State), State};
-compile_tag(<<"!">>, _Content, State) ->
-  {<<"[]">>, State};
-compile_tag(<<"=">>, Content, State) ->
-  {<<"[]">>, set_delimiters(Content, State)}.
+tag(none, Content, State)     -> {escaped_tag(Content, State), State};
+tag(<<"&">>, Content, State)  -> {unescaped_tag(Content, State), State};
+tag(<<"{">>, Content, State)  -> {unescaped_tag(Content, State), State};
+tag(<<"!">>, _Content, State) -> {[], State};
+tag(<<"=">>, Content, State)  -> {[], set_delimiters(Content, State)}.
 
-compile_escaped_tag(Content, State) ->
-  ModBin = atom_to_binary(State#mstate.mod, utf8),
-  KeyBin = compile_dot_notation(Content),
-  [<<"mustache:escape(mustache:get(">>, KeyBin, <<", Ctx, ">>, ModBin, <<"))">>].
+escaped_tag(Name, State) ->
+    case get(Name, State) of
+        undefined   -> [];
+        {ok, Value} -> escape(Value)
+    end.
 
-compile_unescaped_tag(Content, State) ->
-  ModBin = atom_to_binary(State#mstate.mod, utf8),
-  KeyBin = compile_dot_notation(Content),
-  [<<"mustache:get(">>, KeyBin, <<", Ctx, ">>, ModBin, <<")">>].
+unescaped_tag(Name, State) ->
+    case get(Name, State) of
+        undefined   -> [];
+        {ok, Value} -> to_binary(Value)
+    end.
 
-compile_dot_notation(<<".">>) -> <<"[]">>;
-compile_dot_notation(Content) ->
-    Parts = re:split(Content, <<"\\.">>, [unicode]),
-    [$[, join(Parts), $]].
+dot_notation(<<".">>) -> this;
+dot_notation(Content) -> re:split(Content, <<"\\.">>, [unicode]).
 
-join([]) -> [];
-join(List) -> join(List, <<>>).
+get(Name, #state{this = This, context = Context}) ->
+    case dot_notation(Name) of
+        this                    -> {ok, This};
+        Path when is_list(Path) -> get_path(Path, Context)
+    end.
 
-join([Last], Acc) -> [Acc, Last];
-join([Elem | Rest], Acc) -> join(Rest, [Acc, Elem, $,]).
+get_path([], Value) ->
+    {ok, Value};
+get_path([Key | Keys], Map) when is_map(Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> get_path(Keys, Value);
+        error       -> undefined
+    end.
 
-template_dir(Mod) ->
-  DefaultDirPath = filename:dirname(code:which(Mod)),
-  case application:get_env(mustache, templates_dir) of
-    {ok, DirPath} when is_list(DirPath) ->
-      case filelib:ensure_dir(DirPath) of
-        ok -> DirPath;
-        _  -> DefaultDirPath
-      end;
-    _ ->
-      DefaultDirPath
-  end.
-template_path(Mod) ->
-  DirPath = template_dir(Mod),
-  Basename = atom_to_list(Mod),
-  filename:join(DirPath, Basename ++ ".mustache").
+to_binary(Value) when is_integer(Value) -> integer_to_binary(Value);
+to_binary(Value) when is_float(Value)   -> float_to_binary(Value, [{decimals, 2}]);
+to_binary(Value) when is_atom(Value)    -> atom_to_binary(Value, utf8);
+to_binary(Value) when is_binary(Value)  -> Value.
 
-get(Key, Ctx, Mod) ->
-  get(Key, mustache_ctx:module(Mod, Ctx)).
+escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary), <<>>);
+escape(Term)                          -> escape(to_binary(Term)).
 
-get(Key, Ctx) ->
-  case mustache_ctx:get(Key, Ctx) of
-    {ok, Value} -> to_bin(Value);
-    {error, _} -> []
-  end.
-
-to_bin(Value) when is_integer(Value) -> integer_to_binary(Value);
-to_bin(Value) when is_float(Value) -> float_to_binary(Value, [{decimals, 2}]);
-to_bin(Value) when is_atom(Value) -> atom_to_binary(Value, utf8);
-to_bin(Value) -> Value.
-
-escape(Binary) when is_binary(Binary) ->
-  escape(unicode:characters_to_list(Binary), <<>>);
-escape(Term) ->
-    Term.
-
-escape([], Acc) ->
-  Acc;
-escape([$< | Rest], Acc) ->
-  escape(Rest, <<Acc/binary, "&lt;">>);
-escape([$> | Rest], Acc) ->
-  escape(Rest, <<Acc/binary, "&gt;">>);
-escape([$& | Rest], Acc) ->
-  escape(Rest, <<Acc/binary, "&amp;">>);
-escape([X | Rest], Acc) ->
-  escape(Rest, <<Acc/binary, X>>).
-
-escape_special(Binary) ->
-    [escape_char(Char) || Char <- unicode:characters_to_list(Binary)].
-
-escape_char($\0) -> <<"\\0">>;
-escape_char($\n) -> <<"\\n">>;
-escape_char($\t) -> <<"\\t">>;
-escape_char($\b) -> <<"\\b">>;
-escape_char($\r) -> <<"\\r">>;
-escape_char($')  -> <<"\\'">>;
-escape_char($")  -> <<"\\\"">>;
-escape_char($\\) -> <<"\\\\">>;
-escape_char(Char) -> Char.
+escape([],          Acc) -> Acc;
+escape([$< | Rest], Acc) -> escape(Rest, <<Acc/binary, "&lt;">>);
+escape([$> | Rest], Acc) -> escape(Rest, <<Acc/binary, "&gt;">>);
+escape([$& | Rest], Acc) -> escape(Rest, <<Acc/binary, "&amp;">>);
+escape([X | Rest],  Acc) -> escape(Rest, <<Acc/binary, X>>).
 
 set_delimiters(Content, State) ->
     [Left, Right] = re:split(Content, <<" ">>, [{return, list}]),
     {ok, CompiledSectionRE} = section_re(Left, Right),
     {ok, CompiledTagRE} = tag_re(Left, Right),
-    State#mstate{section_re = CompiledSectionRE, tag_re = CompiledTagRE}.
+    State#state{section_re = CompiledSectionRE, tag_re = CompiledTagRE}.
 
 section_re(Left0, Right0) ->
-    {Left1, Right1} = {escape_delimiter(Left0), escape_delimiter(Right0)},
-    Stop = ["([^", hd(Right0), "]*)"],
-    Regexp = [Left1, "(#|\\^)", Stop, Right1, "\\s*(.+?)", Left1, "/\\2", Right1],
+    {{_, Left1}, {[EndChar | _], Right1}} = escape_delimiters(Left0, Right0),
+    Stop = [<<"([^">>, escape_char(EndChar), <<"]*)">>],
+    Regexp = [Left1, <<"(#|\\^)">>, Stop, Right1, <<"\\s*(.+?)">>, Left1, <<"/\\2">>, Right1],
     re:compile(Regexp, [dotall, unicode]).
 
 tag_re(Left0, Right0) ->
-    {Left1, Right1} = {escape_delimiter(Left0), escape_delimiter(Right0)},
+    {{_,Left1}, {_,Right1}} = escape_delimiters(Left0, Right0),
     Regexp = [Left1, "(#|=|!|>|{|&)?(.+?)(=|})?", Right1],
     re:compile(Regexp, [dotall, unicode]).
 
+escape_delimiters(Left0, Right0) ->
+    {Left1, Right1} = {unicode:characters_to_list(Left0), unicode:characters_to_list(Right0)},
+    {{Left1, escape_delimiter(Left1)}, {Right1, escape_delimiter(Right1)}}.
+
 escape_delimiter(Delimiter) ->
-    unicode:characters_to_binary(lists:map(fun (Char) -> [$\\, Char] end, Delimiter)).
+    unicode:characters_to_binary(lists:map(fun escape_char/1, Delimiter)).
 
-%%---------------------------------------------------------------------------
-
-start([T]) ->
-  Out = render(list_to_atom(T)),
-  io:format(Out ++ "~n", []).
+escape_char(Char) -> [$\\, Char].
