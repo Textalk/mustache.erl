@@ -28,60 +28,69 @@
 -include_lib("eunit/include/eunit.hrl").
 
 simple_test() ->
-    Ctx = maps:from_list([{name, "world"}]),
-    Result = mustache:render("Hello {{name}}!", Ctx),
-    ?assertEqual("Hello world!", Result).
+    test_helper(<<"Hello {{name}}!">>, <<"Hello world!">>, #{name => <<"world">>}).
 
 integer_values_too_test() ->
-    Ctx = maps:from_list([{name, "Chris"}, {value, 10000}]),
-    Result = mustache:render("Hello {{name}}~nYou have just won ${{value}}!", Ctx),
-    ?assertEqual("Hello Chris~nYou have just won $10000!", Result).
+    test_helper(
+      <<"Hello {{name}}~nYou have just won ${{value}}!">>,
+      <<"Hello Chris~nYou have just won $10000!">>,
+      #{name => <<"Chris">>, value => 10000}
+    ).
 
 specials_test() ->
-    Ctx = maps:from_list([{name, "Chris"}, {value, 10000}]),
-    Result = mustache:render("\'Hello\n\"{{name}}\"~nYou \"have\" ju\0st\\ won\b\r\"${{value}}!\"\t", Ctx),
-    ?assertEqual("\'Hello\n\"Chris\"~nYou \"have\" ju\0st\\ won\b\r\"$10000!\"\t", Result).
+    test_helper(
+        <<"\'Hello\n\"{{name}}\"~nYou \"have\" ju\0st\\ won\b\r\"${{value}}!\"\t">>,
+        <<"\'Hello\n\"Chris\"~nYou \"have\" ju\0st\\ won\b\r\"$10000!\"\t">>,
+        #{name => <<"Chris">>, value => 10000}
+    ).
 
 binary_test() ->
-    Ctx = #{name => <<"Chris">>, value => 10000},
-    Result = mustache:render(<<"Hello {{name}}~nYou have just won ${{value}}!">>, Ctx),
-    ?assertEqual(<<"Hello Chris~nYou have just won $10000!">>, Result).
+    test_helper(
+      <<"Hello {{name}}~nYou have just won ${{value}}!">>,
+      <<"Hello Chris~nYou have just won $10000!">>,
+      #{name => <<"Chris">>, value => 10000}
+    ).
 
 simple_dot_test() ->
-    Ctx = #{name => #{first => <<"Emil">>, last => <<"Falk">>}},
-    Result = mustache:render(<<"Hello {{name.first}} {{name.last}}!">>, Ctx),
-    ?assertEqual(<<"Hello Emil Falk!">>, Result).
+    test_helper(
+      <<"Hello {{name.first}} {{name.last}}!">>,
+      <<"Hello Emil Falk!">>,
+      #{name => #{first => <<"Emil">>, last => <<"Falk">>}}
+    ).
 
 simple_section_dot_test() ->
-    Ctx = #{test => lists:seq(1,3)},
-    Result = mustache:render(<<"{{#test}}{{.}}{{/test}}">>, Ctx),
-    ?assertEqual(<<"123">>, Result).
+    test_helper(<<"{{#test}}{{.}}{{/test}}">>, <<"123">>, #{test => lists:seq(1,3)}).
 
 complex_section_dot_test() ->
-    Ctx = #{test1 => #{test2 => lists:seq(1, 3)}},
-    Result = mustache:render(<<"{{#test1.test2}}{{.}}{{/test1.test2}}">>, Ctx),
-    ?assertEqual(<<"123">>, Result).
+    test_helper(
+        <<"{{#test1.test2}}{{.}}{{/test1.test2}}">>,
+        <<"123">>,
+        #{test1 => #{test2 => lists:seq(1, 3)}}
+    ).
 
 object_section_test() ->
-    Ctx = #{test => #{name => <<"Emil">>}},
-    Result = mustache:render(<<"{{#test}}{{name}}{{/test}}">>, Ctx),
-    ?assertEqual(<<"Emil">>, Result).
+    test_helper(<<"{{#test}}{{name}}{{/test}}">>, <<"Emil">>, #{test => #{name => <<"Emil">>}}).
 
 fun_test() ->
-    Ctx = #{test1 => fun (Text) -> re:replace(Text, "xxx", "yyy") end,
-            test2 => "xxx"},
-    Result = mustache:render(<<"{{#test1}}{{test2}}{{/test1}}">>, Ctx),
-    ?assertEqual(<<"yyy">>, Result).
+    test_helper(
+      <<"{{#test1}}{{test2}}{{/test1}}">>,
+      <<"yyy">>,
+      #{test1 => fun (Text) -> re:replace(Text, "xxx", "yyy") end, test2 => "xxx"}
+    ).
 
 set_delimiter_test() ->
-    Ctx = #{test1 => <<"TEST1">>, test2 => <<"TEST2">>},
-    Result = mustache:render(<<"{{=[[ ]]=}}[[{test1}]] [[={{ }}=]]{{{test2}}}">>, Ctx),
-    ?assertEqual(<<"TEST1 TEST2">>, Result).
+    test_helper(
+        <<"{{=[[ ]]=}}[[{test1}]] [[={{ }}=]]{{{test2}}}">>,
+        <<"TEST1 TEST2">>,
+        #{test1 => <<"TEST1">>, test2 => <<"TEST2">>}
+    ).
 
 set_delimiter_boolean_section_test() ->
-    Ctx = #{test1 => #{test2 => true}},
-    Result = mustache:render(<<"{{=[[ ]]=}}[[#test1.test2]]TEST[[/test1.test2]] {{::test}}">>, Ctx),
-    ?assertEqual(<<"TEST {{::test}}">>, Result).
+    test_helper(
+        <<"{{=[[ ]]=}}[[#test1.test2]]TEST[[/test1.test2]] {{::test}}">>,
+        <<"TEST {{::test}}">>,
+        #{test1 => #{test2 => true}}
+    ).
 
 %% ===================================================================
 %% basic tag types
@@ -91,7 +100,7 @@ tag_type_variable_empty_test() ->
     test_helper("{{name}}", "", []).
 
 tag_type_variable_string_test() ->
-    test_helper("{{name}}", "NAME", [{name, "NAME"}]).
+    test_helper("{{name}}", "NAME", [{name, <<"NAME">>}]).
 
 tag_type_variable_integer_test() ->
     test_helper("{{name}}", "1", [{name, 1}]).
@@ -100,13 +109,13 @@ tag_type_variable_atom_test() ->
     test_helper("{{name}}", "atom", [{name, atom}]).
 
 tag_type_varibale_escaped_test() ->
-    test_helper("{{name}}", "&gt;&amp;do&lt;it&gt;", [{name, ">&do<it>"}]).
+    test_helper("{{name}}", "&gt;&amp;do&lt;it&gt;", [{name, <<">&do<it>">>}]).
 
 tag_type_variabel_unescaped_test() ->
-    test_helper("{{{name}}}", ">dont&do<it>", [{name, ">dont&do<it>"}]).
+    test_helper("{{{name}}}", ">dont&do<it>", [{name, <<">dont&do<it>">>}]).
 
 tag_type_variable_unescaped_with_ampersand_test() ->
-    test_helper("{{&name}}", ">dont&do<it>", [{name, ">dont&do<it>"}]).
+    test_helper("{{&name}}", ">dont&do<it>", [{name, <<">dont&do<it>">>}]).
 
 
 tag_type_section_empty_test() ->
@@ -152,8 +161,12 @@ tag_type_comment_empty_test() ->
 tag_type_comment_multiline_test() ->
     test_helper("{{!\ncomment\ncomment\ncomment\n\n}}", "", []).
 
-
-test_helper(Template, Expected, CtxList) ->
-    Ctx = maps:from_list(CtxList),
-    ?assertEqual(Expected, mustache:render(Template, Ctx)).
-
+test_helper(Template, Expected, Ctx) when is_list(Template), is_list(Expected) ->
+    test_helper(
+      unicode:characters_to_binary(Template),
+      unicode:characters_to_binary(Expected),
+      Ctx
+     );
+test_helper(Template, Expected, Ctx) ->
+    Result = iolist_to_binary(mustache:render(Template, Ctx)),
+    ?assertEqual(Expected, Result).
