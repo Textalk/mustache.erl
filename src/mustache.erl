@@ -37,9 +37,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 compile(Template) when is_binary(Template) ->
-    fun(Context) -> sections(Template, set_delimiters(<<"{{ }}">>, #state{context = Context})) end;
-compile(Template) when is_list(Template) ->
-    compile(unicode:characters_to_binary(Template)).
+    fun (Context) ->
+        iolist_to_binary(sections(Template, set_delimiters(<<"{{ }}">>, #state{context = Context})))
+    end.
 
 render(Template, Context) when (is_list(Template) orelse is_binary(Template)) andalso is_map(Context) ->
     Render = compile(Template),
@@ -80,9 +80,9 @@ section(<<"#">>, Name, Content, State) ->
                 SubContext when is_map(SubContext) ->
                     sections(Content, State#state{context = SubContext});
                 Fun when is_function(Fun, 1) ->
-                    Fun(sections(Content, State));
-                _Other ->
-                    sections(Content, State)
+                    sections(Fun(Content), State);
+                Other ->
+                    sections(Content, State#state{this = Other})
             end
     end;
 section(<<"^">>, Name, Content, State) ->
@@ -153,14 +153,14 @@ to_binary(Value) when is_float(Value)   -> float_to_binary(Value, [{decimals, 2}
 to_binary(Value) when is_atom(Value)    -> atom_to_binary(Value, utf8);
 to_binary(Value) when is_binary(Value)  -> Value.
 
-escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary), <<>>);
+escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary), []);
 escape(Term)                          -> escape(to_binary(Term)).
 
-escape([],          Acc) -> Acc;
-escape([$< | Rest], Acc) -> escape(Rest, <<Acc/binary, "&lt;">>);
-escape([$> | Rest], Acc) -> escape(Rest, <<Acc/binary, "&gt;">>);
-escape([$& | Rest], Acc) -> escape(Rest, <<Acc/binary, "&amp;">>);
-escape([X | Rest],  Acc) -> escape(Rest, <<Acc/binary, X>>).
+escape([],          Acc) -> unicode:characters_to_binary(Acc);
+escape([$< | Rest], Acc) -> escape(Rest, [Acc, <<"&lt;">>]);
+escape([$> | Rest], Acc) -> escape(Rest, [Acc, <<"&gt;">>]);
+escape([$& | Rest], Acc) -> escape(Rest, [Acc, <<"&amp;">>]);
+escape([X | Rest],  Acc) -> escape(Rest, [Acc, X]).
 
 set_delimiters(Content, State) ->
     [Left, Right] = re:split(Content, <<" ">>, [{return, list}]),
@@ -176,7 +176,7 @@ section_re(Left0, Right0) ->
 
 tag_re(Left0, Right0) ->
     {{_,Left1}, {_,Right1}} = escape_delimiters(Left0, Right0),
-    Regexp = [Left1, "(#|=|!|>|{|&)?(.+?)(=|})?", Right1],
+    Regexp = [Left1, "(#|=|!|>|{|&)?\\h*(.+?)\\h*(=|})?", Right1],
     re:compile(Regexp, [dotall, unicode]).
 
 escape_delimiters(Left0, Right0) ->

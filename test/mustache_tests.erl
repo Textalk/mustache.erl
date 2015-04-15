@@ -73,9 +73,10 @@ object_section_test() ->
 
 fun_test() ->
     test_helper(
-      <<"{{#test1}}{{test2}}{{/test1}}">>,
+      <<"{{#test1}}xxx{{/test1}}">>,
       <<"yyy">>,
-      #{<<"test1">> => fun (Text) -> re:replace(Text, <<"xxx">>, <<"yyy">>) end, <<"test2">> => <<"xxx">>}
+      #{<<"test1">> => fun (Text) -> re:replace(Text, <<"xxx">>, <<"{{test2}}">>, [{return, binary}]) end,
+        <<"test2">> => <<"yyy">>}
     ).
 
 set_delimiter_test() ->
