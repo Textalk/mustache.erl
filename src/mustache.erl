@@ -29,7 +29,7 @@
 
 -record(state, {
           this,
-          context = #{},
+          contexts = #{},
           section_re,
           tag_re
          }).
@@ -38,7 +38,7 @@
 
 compile(Template) when is_binary(Template) ->
     fun (Context) ->
-        iolist_to_binary(sections(Template, set_delimiters(<<"{{ }}">>, #state{context = Context})))
+        iolist_to_binary(sections(Template, set_delimiters(<<"{{ }}">>, #state{contexts = [Context]})))
     end.
 
 render(Template, Context) when (is_list(Template) orelse is_binary(Template)) andalso is_map(Context) ->
@@ -65,20 +65,24 @@ sections(Template, #state{section_re = SectionRE} = State) ->
             tags(Template, State)
     end.
 
-section(<<"#">>, Name, Content, State) ->
+section(<<"#">>, Name, Content, #state{contexts = Contexts} = State) ->
     case get(Name, State) of
         undefined ->
             [];
         {ok, Value} ->
             case Value of
-                False when False =:= false; False =:= [] ->
+                %% TODO: Empty string is not falsy according to the specification
+                False when False =:= false;
+                           False =:= [];
+                           False =:= <<>> ->
                     [];
                 [Context | _] = SubContexts when is_map(Context) ->
-                    [sections(Content, State#state{context = SubContext}) || SubContext <- SubContexts];
+                    [sections(Content, State#state{contexts = [SubContext | Contexts]})
+                     || SubContext <- SubContexts];
                 List when is_list(List) ->
                     [sections(Content, State#state{this = Item}) || Item <- List];
                 SubContext when is_map(SubContext) ->
-                    sections(Content, State#state{context = SubContext});
+                    sections(Content, State#state{contexts = [SubContext | Contexts]});
                 Fun when is_function(Fun, 1) ->
                     sections(Fun(Content), State);
                 Other ->
@@ -88,7 +92,10 @@ section(<<"#">>, Name, Content, State) ->
 section(<<"^">>, Name, Content, State) ->
     case get(Name, State) of
         undefined -> sections(Content, State);
-        {ok, False} when False =:= false; False =:= [] -> sections(Content, State);
+        %% TODO: Empty string is not falsy according to the specification
+        {ok, False} when False =:= false;
+                         False =:= [];
+                         False =:= <<>> -> sections(Content, State);
         {ok, _Other} -> []
     end.
 
@@ -134,10 +141,16 @@ unescaped_tag(Name, State) ->
 dot_notation(<<".">>) -> this;
 dot_notation(Content) -> re:split(Content, <<"\\.">>, [unicode]).
 
-get(Name, #state{this = This, context = Context}) ->
-    case dot_notation(Name) of
-        this                    -> {ok, This};
-        Path when is_list(Path) -> get_path(Path, Context)
+get(Name, State) when is_binary(Name) -> get(dot_notation(Name), State);
+get(this, #state{this = This}) -> {ok, This};
+get(Path, #state{contexts = Contexts}) -> context_get(Path, Contexts).
+
+context_get(_Path, []) ->
+    undefined;
+context_get(Path, [Context | Contexts]) ->
+    case get_path(Path, Context) of
+        {ok, Value} -> {ok, Value};
+        undefined   -> context_get(Path, Contexts)
     end.
 
 get_path([], Value) ->
@@ -156,11 +169,11 @@ to_binary(Value) when is_binary(Value)  -> Value.
 escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary), []);
 escape(Term)                          -> escape(to_binary(Term)).
 
-escape([],          Acc) -> unicode:characters_to_binary(Acc);
-escape([$< | Rest], Acc) -> escape(Rest, [Acc, <<"&lt;">>]);
-escape([$> | Rest], Acc) -> escape(Rest, [Acc, <<"&gt;">>]);
-escape([$& | Rest], Acc) -> escape(Rest, [Acc, <<"&amp;">>]);
-escape([X | Rest],  Acc) -> escape(Rest, [Acc, X]).
+escape([],          Acc) -> unicode:characters_to_binary(lists:reverse(Acc));
+escape([$< | Rest], Acc) -> escape(Rest, [<<"&lt;">> | Acc]);
+escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
+escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
+escape([X | Rest],  Acc) -> escape(Rest, [X | Acc]).
 
 set_delimiters(Content, State) ->
     [Left, Right] = re:split(Content, <<" ">>, [{return, list}]),
@@ -171,7 +184,7 @@ set_delimiters(Content, State) ->
 section_re(Left0, Right0) ->
     {{_, Left1}, {[EndChar | _], Right1}} = escape_delimiters(Left0, Right0),
     Stop = [<<"([^">>, escape_char(EndChar), <<"]*)">>],
-    Regexp = [Left1, <<"(#|\\^)">>, Stop, Right1, <<"\\s*(.+?)">>, Left1, <<"/\\2">>, Right1],
+    Regexp = [Left1, <<"(#|\\^)">>, Stop, Right1, <<"(.+?)">>, Left1, <<"/\\2">>, Right1],
     re:compile(Regexp, [dotall, unicode]).
 
 tag_re(Left0, Right0) ->
