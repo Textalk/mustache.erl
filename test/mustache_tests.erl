@@ -27,23 +27,6 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-compile_test() ->
-    Template = <<"1{{a}}2{{{b}}}3{{#c}}4{{#d}}xxx{{/d}}5{{/c}}6{{^e}}yyy{{/e}}7{{& f}}8{{! apa}}9">>,
-    Expected = [<<"1">>,
-                {tag, escaped, [<<"a">>]},
-                <<"2">>,
-                {tag, unescaped, [<<"b">>]},
-                {section, normal, [<<"c">>], [<<"4">>, {section, normal, [<<"d">>], [<<"xxx">>]}, <<"5">>]},
-                <<"6">>,
-                {section, inverted, [<<"e">>], [<<"yyy">>]},
-                <<"7">>,
-                {tag, unescaped, [<<"f">>]},
-                <<"8">>,
-                <<"9">>],
-    Result = mustache:compile(Template),
-    ?debugFmt("Sections: ~p~n~n", [Result]),
-    ?assertEqual(Expected, Result).
-
 %simple_test() ->
 %    test_helper(<<"Hello {{name}}!">>, <<"Hello world!">>, #{<<"name">> => <<"world">>}).
 %

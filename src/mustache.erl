@@ -25,39 +25,116 @@
 
 -module(mustache).
 -author("Tom Preston-Werner").
--export([compile/1]).
+-export([tokenize/1]).
 
 -record(state, {
-          left = <<"{{({|">>,
+          left = <<"{{">>,
           right = <<"}}">>,
-          path = []
+          tag_re = compile_regexp(<<"{{">>, <<"}}">>),
+          path = [],
+          depth = 0
          }).
 
 -include_lib("eunit/include/eunit.hrl").
 
-compile(Template) when is_binary(Template) ->
-    tags(Template, #state{}, []).
+tokenize(Template) ->
+    tokenize(Template, compile_regexp(<<"{{">>, <<"}}">>), []).
 
-tags(<<>>, _State, Acc) -> lists:reverse(Acc);
-tags(Template, #state{left = Left} = State0) ->
-    case re:run(Template, Left) of
-        {match, [{M0, M1} | Type]} ->
-
-            Front = erlang:binary_part(Template, 0, M0),
-            Rest
-            Type = tag_type(Type, Template) of
-                none -> parse_tag(
+tokenize(<<>>, _RE, Tokens) -> lists:reverse(Tokens);
+tokenize(Template, RE, Tokens0) ->
+    case re:run(Template, RE) of
         nomatch ->
-            [Template | Acc]
+            lists:reverse([Template | Tokens0]);
+        {match, Match0} ->
+            {Front, Token, Rest} = parse_token(Template, fix_match(Match0)),
+            Tokens1 = case Front of <<>> -> Tokens0; _ -> [Front | Tokens0] end,
+            case Token of
+                {delimiters, Left, Right} ->
+                    tokenize(Rest, compile_regexp(Left, Right), Tokens1);
+                {comment, _Comment} ->
+                    tokenize(Rest, RE, Tokens1);
+                _Other ->
+                    tokenize(Rest, RE, [Token | Tokens1])
+            end
     end.
 
-kind(_Template, []) -> none;
-kind(Template, [{K0, K1}]) ->erlang:binary_part(Template, K0, K1).
+fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
+fix_match([_, Total, Left, Tag, Right]) -> [Left, Right, {Total, Tag}];
+fix_match([Total, Left, Tag]) -> [Left, {Total, Tag}].
 
-tag(<<"=">>, Content, State)  ->
-    {[], set_delimiters(Content, State)};
-tag(Type, Content, State) ->
-    {{tag, Type, Content}, State}.
+parse_token(Template, [{-1, 0}, Rest]) ->
+    parse_token(Template, [none, Rest]);
+parse_token(Template, [{Left, 1} | Rest]) ->
+    parse_token(Template, [binary:at(Template, Left) | Rest]);
+parse_token(Template, [Left, {Right, 1} | Rest]) when is_integer(Left) ->
+    true = matching(Left, binary:at(Template, Right)),
+    parse_token(Template, [Left | Rest]);
+parse_token(Template, [Type, {{Start, Size}, {TagStart, TagSize}}]) ->
+    Front = erlang:binary_part(Template, 0, Start),
+    Tag = erlang:binary_part(Template, TagStart, TagSize),
+    RestStart = Start + Size,
+    Rest = erlang:binary_part(Template, RestStart, byte_size(Template) - RestStart),
+    Token = parse_tag(Type, Tag),
+    {Front, Token, Rest}.
 
-parse_key(<<".">>) -> this;
-parse_key(Content) -> re:split(Content, <<"\\.">>, [unicode]).
+parse_tag(none, Tag) -> {escaped, parse_key(Tag)};
+parse_tag($#, Tag) -> {section, parse_key(Tag)};
+parse_tag($^, Tag) -> {inverted_section, parse_key(Tag)};
+parse_tag($/, Tag) -> {end_section, parse_key(Tag)};
+parse_tag(${, Tag) -> {unescaped, parse_key(Tag)};
+parse_tag($&, Tag) -> {unescaped, parse_key(Tag)};
+parse_tag($!, Comment) -> {comment, Comment};
+parse_tag($=, Delimiters) ->
+    [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
+    {delimiters, Left, Right}.
+
+parse_key(Tag) -> re:split(Tag, <<"\\.">>, [trim, unicode]).
+
+matching(${, $}) -> true;
+matching($=, $=) -> true;
+matching(_, _)   -> false.
+
+compile_regexp(Left0, Right0) ->
+    {Left1, Right1} = tag_start_end(Left0, Right0),
+    TagRE = ["(", Left1, "({|=)(.+?)(}|=)", Right1, ")|(", Left1, "(#|\\^|!|&|/)?\\s*(.+?)", Right1, ")"],
+    {ok, CompiledTagRE} = re:compile(TagRE, [unicode]),
+    CompiledTagRE.
+
+tag_start_end(Left, Right) ->
+    LeftStr = unicode:characters_to_list(Left),
+    RightStr = unicode:characters_to_list(Right),
+    {escape(LeftStr), escape(RightStr)}.
+
+escape(Str) -> lists:map(fun (Char) -> [$\\, Char] end, Str).
+
+-ifdef(EUNIT).
+
+tokenize_test_() ->
+    [?_assertEqual(
+        [<<"a">>, {escaped, [<<"apa">>]}, <<"b">>, {escaped, [<<"bepa">>]}, <<"c">>, {escaped, [<<"cepa">>]}, <<"d">>],
+        tokenize(<<"a{{apa}}b{{bepa}}c{{cepa}}d">>)
+       ),
+     ?_assertEqual(
+        [{escaped, [<<"a">>]}, {unescaped, [<<"b">>]}, {section, [<<"c">>]}, {inverted_section, [<<"d">>]},
+         {end_section, [<<"e">>]}, {unescaped, [<<"g">>]}],
+        tokenize(<<"{{a}}{{{b}}}{{#c}}{{^d}}{{/e}}{{!f}}{{=[[ ]]=}}[[&g]]">>)
+       )
+    ].
+
+compile_regexp_test_() ->
+    TagRE = compile_regexp(<<"{{">>, <<"}}">>),
+    TestTagRE = fun (Template) -> fix_match(element(2, re:run(Template, TagRE))) end,
+
+    [
+     %% Tag
+     ?_assertEqual([{-1, 0}, {{1, 7}, {3, 3}}], TestTagRE(<<"X{{apa}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {7, 1}, {{1, 9}, {4, 3}}], TestTagRE(<<"X{{{apa}}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {7, 1}, {{1, 9}, {4, 3}}], TestTagRE(<<"X{{=apa=}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{#apa}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{^apa}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{!apa}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{/apa}}Y{{bepa}}Z">>)),
+     ?_assertEqual([{3, 1}, {{1, 10}, {6, 3}}], TestTagRE(<<"X{{#  apa}}Y{{bepa}}Z">>))
+    ].
+
+-endif.
