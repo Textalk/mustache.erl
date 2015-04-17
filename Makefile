@@ -1,18 +1,7 @@
-ERL ?= erl
-EBIN_DEPS_DIRS := $(wildcard deps/*/ebin)
+PROJECT = mustache
 
-all: deps compile
+DEPS = merl
 
-compile:
-	@rebar compile
+dep_merl = git https://github.com/richcarl/merl.git master
 
-test:
-	@rebar eunit skip_deps=true
-
-deps:
-	@rebar get-deps
-
-run:
-	@$(ERL) -pa ebin/ -pa $(EBIN_DEPS_DIRS)
-
-.PHONY: test
+include erlang.mk

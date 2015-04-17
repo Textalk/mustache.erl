@@ -25,17 +25,46 @@
 
 -module(mustache).
 -author("Tom Preston-Werner").
--export([tokenize/1]).
+-export([compile/1]).
 
 -record(state, {
-          left = <<"{{">>,
-          right = <<"}}">>,
-          tag_re = compile_regexp(<<"{{">>, <<"}}">>),
+          contexts,
           path = [],
           depth = 0
          }).
 
 -include_lib("eunit/include/eunit.hrl").
+
+compile(Template) ->
+    Tokens = tokenize(Template),
+    Result = parse_ast(Tokens),
+    erl_syntax:revert(Result).
+
+parse_ast(Tokens) ->
+    Contexts = [context_var(0)],
+    State = #state{contexts = Contexts},
+    erl_syntax:fun_expr([erl_syntax:clause(Contexts, [], [parse_ast(Tokens, State, [])])]).
+
+parse_ast([], #state{path = [], depth = 0}, AST) ->
+    erl_syntax:list(lists:reverse(AST));
+parse_ast([{escaped, Key} | Tokens], #state{contexts = Contexts} = State, AST) ->
+    Node = erl_syntax:application(
+             erl_syntax:atom(?MODULE),
+             erl_syntax:atom(escape),
+             [erl_syntax:application(
+                erl_syntax:atom(?MODULE),
+                erl_syntax:atom(get_binary),
+                [erl_syntax:abstract(Key),
+                 erl_syntax:list(Contexts)]
+               )]
+            ),
+    parse_ast(Tokens, State, [Node | AST]);
+parse_ast([Binary | Tokens], State, AST) when is_binary(Binary) ->
+    Node = erl_syntax:abstract(Binary),
+    parse_ast(Tokens, State, [Node | AST]).
+
+context_var(Depth) ->
+    erl_syntax:variable("Ctx" ++ integer_to_list(Depth)).
 
 tokenize(Template) ->
     tokenize(Template, compile_regexp(<<"{{">>, <<"}}">>), []).
@@ -108,6 +137,17 @@ tag_start_end(Left, Right) ->
 escape(Str) -> lists:map(fun (Char) -> [$\\, Char] end, Str).
 
 -ifdef(EUNIT).
+
+compile_test_() ->
+    CompileTest = fun (Template) -> erl_prettypr:format(compile(Template)) end,
+    [?_assertEqual(
+        "fun (Ctx0) -> [<<116, 101, 115, 116>>] end",
+        CompileTest(<<"test">>)
+     ),
+     ?_assertEqual(
+        "fun (Ctx0) -> [escape(mustache:get_binary([<<97>>], [Ctx0]))] end",
+        CompileTest(<<"{{a}}">>)
+     )].
 
 tokenize_test_() ->
     [?_assertEqual(
