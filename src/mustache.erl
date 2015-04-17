@@ -1,6 +1,6 @@
 %% The MIT License
 %%
-%% Copyright (c) 2009 Tom Preston-Werner <tom@mojombo.com>
+%% Copyright (c) 2015 Emil Falk <emph@riseup.net>
 %%
 %% Permission is hereby granted, free of charge, to any person obtaining a copy
 %% of this software and associated documentation files (the "Software"), to deal
@@ -20,12 +20,8 @@
 %% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 %% THE SOFTWARE.
 
-%% See the README at http://github.com/mojombo/mustache.erl for additional
-%% documentation and usage examples.
-
 -module(mustache).
--author("Tom Preston-Werner").
--export([compile/1]).
+-export([compile/1, get/2, get_binary/2, escape/1]).
 
 -record(state, {
           contexts,
@@ -51,17 +47,60 @@ parse_ast([{escaped, Key} | Tokens], #state{contexts = Contexts} = State, AST) -
     Node = erl_syntax:application(
              erl_syntax:atom(?MODULE),
              erl_syntax:atom(escape),
-             [erl_syntax:application(
-                erl_syntax:atom(?MODULE),
-                erl_syntax:atom(get_binary),
-                [erl_syntax:abstract(Key),
-                 erl_syntax:list(Contexts)]
-               )]
+             [binary_get_call(Key, Contexts)]
             ),
+    parse_ast(Tokens, State, [Node | AST]);
+parse_ast([{unescaped, Key} | Tokens], #state{contexts = Contexts} = State, AST) ->
+    Node = binary_get_call(Key, Contexts),
     parse_ast(Tokens, State, [Node | AST]);
 parse_ast([Binary | Tokens], State, AST) when is_binary(Binary) ->
     Node = erl_syntax:abstract(Binary),
     parse_ast(Tokens, State, [Node | AST]).
+
+binary_get_call(Key, Contexts) ->
+    erl_syntax:application(
+      erl_syntax:atom(?MODULE), erl_syntax:atom(get_binary),
+      [erl_syntax:abstract(Key), erl_syntax:list(Contexts)]
+     ).
+
+get([], [Item | _Contexts]) -> {ok, Item};
+get(Key, Contexts)          -> context_get(Key, Contexts).
+
+get_binary(Key, Contexts) ->
+    case get(Key, Contexts) of
+        undefined   -> <<>>;
+        {ok, Value} -> to_binary(Value)
+    end.
+
+context_get(_Path, []) ->
+    undefined;
+context_get(Path, [Context | Contexts]) ->
+    case get_path(Path, Context) of
+        {ok, Value} -> {ok, Value};
+        undefined   -> context_get(Path, Contexts)
+    end.
+
+get_path([], Value) ->
+    {ok, Value};
+get_path([Key | Keys], Map) when is_map(Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> get_path(Keys, Value);
+        error       -> undefined
+    end.
+
+to_binary(Value) when is_integer(Value) -> integer_to_binary(Value);
+to_binary(Value) when is_float(Value)   -> float_to_binary(Value, [{decimals, 2}]);
+to_binary(Value) when is_atom(Value)    -> atom_to_binary(Value, utf8);
+to_binary(Value) when is_binary(Value)  -> Value.
+
+escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary));
+escape(String) when is_list(String)   -> escape(String, []).
+
+escape([], Acc)          -> unicode:characters_to_binary(lists:reverse(Acc));
+escape([$< | Rest], Acc) -> escape(Rest, [<<"&lt;">> | Acc]);
+escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
+escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
+escape([X | Rest], Acc)  -> escape(Rest, [X | Acc]).
 
 context_var(Depth) ->
     erl_syntax:variable("Ctx" ++ integer_to_list(Depth)).
@@ -69,7 +108,8 @@ context_var(Depth) ->
 tokenize(Template) ->
     tokenize(Template, compile_regexp(<<"{{">>, <<"}}">>), []).
 
-tokenize(<<>>, _RE, Tokens) -> lists:reverse(Tokens);
+tokenize(<<>>, _RE, Tokens) ->
+    lists:reverse(Tokens);
 tokenize(Template, RE, Tokens0) ->
     case re:run(Template, RE) of
         nomatch ->
@@ -78,6 +118,7 @@ tokenize(Template, RE, Tokens0) ->
             {Front, Token, Rest} = parse_token(Template, fix_match(Match0)),
             Tokens1 = case Front of <<>> -> Tokens0; _ -> [Front | Tokens0] end,
             case Token of
+                {
                 {delimiters, Left, Right} ->
                     tokenize(Rest, compile_regexp(Left, Right), Tokens1);
                 {comment, _Comment} ->
@@ -132,9 +173,9 @@ compile_regexp(Left0, Right0) ->
 tag_start_end(Left, Right) ->
     LeftStr = unicode:characters_to_list(Left),
     RightStr = unicode:characters_to_list(Right),
-    {escape(LeftStr), escape(RightStr)}.
+    {escape_string(LeftStr), escape_string(RightStr)}.
 
-escape(Str) -> lists:map(fun (Char) -> [$\\, Char] end, Str).
+escape_string(String) -> lists:map(fun (Char) -> [$\\, Char] end, String).
 
 -ifdef(EUNIT).
 
