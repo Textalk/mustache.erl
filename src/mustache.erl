@@ -21,14 +21,7 @@
 %% THE SOFTWARE.
 
 -module(mustache).
--export([compile/1, get/2, get_binary/2, escape/1]).
-
--record(state, {
-          regexp,
-          contexts,
-          path = [],
-          depth = 0
-         }).
+-export([parse/1, tokenize/1, get/2, get_binary/2, escape/1]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -72,148 +65,77 @@ escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
 escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
 escape([X | Rest], Acc)  -> escape(Rest, [X | Acc]).
 
-context_var(Depth) ->
-    erl_syntax:variable("Ctx" ++ integer_to_list(Depth)).
+parse(Template) when is_binary(Template) ->
+    parse(tokenize(Template));
+parse(Tokens) when is_list(Tokens) ->
+  parse(Tokens, [], []).
 
-compile(Template) ->
-    Context = context_var(0),
-    Regexp = compile_regexp(<<"{{">>, <<"}}">>),
-    State = #state{contexts = [Context], regexp = Regexp},
-    case compile(Template, State, []) of
-        {ok, Body} ->
-            Clause = erl_syntax:clause(Context, [], [Body]),
-            RenderFunExpr = erl_syntax:fun_expr([Clause]),
-            {value, RenderFun, _} = erl_eval:expr(
-                                      RenderFunExpr,
-                                      erl_eval:new_bindings()
-                                     ),
-            {ok, RenderFun};
-        {error, Reason} ->
-            {error, Reason}
+parse([], [], Acc) ->
+    lists:reverse(Acc);
+parse([Token | Rest], Path, Acc) ->
+    case Token of
+        {Section, Key} when Section =:= section;
+                            Section =:= inverted_section ->
+            {Body, AfterSection} = parse(Rest, [Key | Path], []),
+            parse(AfterSection, Path, [{Section, Key, Body} | Acc]);
+        {end_section, Key} when Key =:= hd(Path) ->
+            {lists:reverse(Acc), Rest};
+        {Tag, _Key} when Tag =:= escaped;
+                         Tag =:= unescaped ->
+            parse(Rest, Path, [Token | Acc])
     end.
 
-compile(<<>>, #state{path = [], depth = 0}, ASTAcc) ->
-    {ok, erl_syntax:list(lists:reverse(ASTAcc))};
-compile(<<>>, _State, _ASTAcc) ->
-    {error, unterminated_sections};
-compile(Template, State, ASTAcc0) ->
-    #state{regexp = Regexp, contexts = Contexts} = State0,
+tokenize(Template) ->
+    Regexp = compile_regexp(<<"{{">>, <<"}}">>),
+    tokenize(Template, Regexp, []).
+
+tokenize(<<>>, _Regexp, Acc) ->
+  lists:reverse(Acc);
+tokenize(Template, Regexp, Acc0) ->
     case re:run(Template, Regexp) of
         nomatch ->
-            compile(<<>>, State, [erl_syntax:abstract(Template) | ASTAcc0]);
-        {match, Match0} ->
-            {Front, Tag, Back} = split_template(Template, fix_match(Match0)),
-            ASTAcc1 = case Front of
-                          undefined -> ASTAcc0;
-                          FrontNode -> [FrontNode | ASTAcc0]
-                      end,
-            compile_tag(Tag, Back, State, ASTAcc1)
+            tokenize(<<>>, Regexp, [Template | Acc0]);
+        {match, Match} ->
+            {Front, Tag, Back} = split_template(Template, fix_match(Match)),
+            Acc1 = case Front of
+                     <<>> -> Acc0;
+                     _    -> [Front | Acc0]
+                   end,
+            case Tag of
+              {delimiters, Left, Right} -> tokenize(Back, compile_regexp(Left, Right), Acc1);
+              {comment, _Comment}       -> tokenize(Back, Regexp, Acc1);
+              _                         -> tokenize(Back, Regexp, [Tag | Acc1])
+            end
     end.
-
-compile_tag({delimiter, Left, Right}, Back, State, ASTAcc) ->
-    compile(Back, State#state{regexp = compile_regexp(Left, Right)}, ASTAcc);
-compile_tag({comment, _Comment}, Back, State, ASTAcc) ->
-    compile(Back, State, ASTAcc);
-compile_tag({escaped, Key}, Back, State, ASTAcc) ->
-    compile(Back, State, [get_escaped_ast(Key, State) | ASTAcc]);
-compile_tag({unescaped, Key}, Back, State, ASTAcc) ->
-    compile(Back, State, [get_unescaped_ast(Key, State) | ASTAcc]);
-compile_tag({section, Key}, Back0, State0, ASTAcc) ->
-    {Back1, SectionAST, State1} = section_ast(Key, Back0, State0)
-    compile(Back1, State2, [SectionAST | ASTAcc]);
-compile_tag({end_section, Key}, Back, #state{path = [Key | Path]} = State0,
-            ASTAcc) ->
-    #state{contexts = [_ | Contexts], depth = Depth} = State0,
-    State1 = State0#state{
-               contexts = Contexts,
-               depth    = Depth - 1,
-               path     = Path
-              },
-    {Back, erl_syntax:list(lists:reverse(ASTAcc)), State1}.
-
-get_ast(Key, #state{contexts = Contexts0}) ->
-    Contexts1 = erl_syntaxt:list(
-                  lists:map(fun (Context) -> erl_syntax:variable(Context) end)
-                 ),
-    erl_syntax:application(
-      erl_syntax:atom(?MODULE), erl_syntax:atom(get),
-      [erl_syntax:abstract(Key), Contexts1]
-     ).
-
-get_escaped_ast(Key, State) ->
-    erl_syntax:application(
-      erl_syntax:atom(?MODULE),
-      erl_syntax:atom(escape),
-      [get_unescaped_ast(Key, State)]
-     ).
-
-get_unescaped_ast(Key, State) ->
-    erl_syntax:application(
-      erl_syntax:atom(?MODULE), erl_syntax:atom(to_binary),
-      [get_ast(Key, State)]
-     ).
-
-section_ast(Key, Back, #state{contexts = Contexts} = State) ->
-    erl_syntax:case_expr(
-      get_ast(Key, Contexts),
-      [false_clause_ast(Contexts),
-       list_clause_ast(Var)]
-     ).
-
-false_clause_ast(Contexts) ->
-    VariableName = erl_syntax_lib:new_variable_name(sets:from_list(Contexts)),
-    Variable = erl_syntax:variable(VariableName),
-    erl_syntax:clause(
-      [Variable],
-      [false_guard_ast(Variable, false),
-       false_guard_ast(Variable, []),
-       false_guard_ast(Variable, <<>>)],
-      [erl_syntax:nil()]
-     ).
-
-false_guard_ast(Var, Falsy) ->
-       erl_syntax:infix_expr(
-         Var,
-         erl_syntax:operator('=:='),
-         erl_syntax:abstract(Falsy)
-        ).
 
 fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
 fix_match([_, Total, Left, Tag, Right]) -> [Left, Right, {Total, Tag}];
 fix_match([Total, Left, Tag]) -> [Left, {Total, Tag}].
 
-split_template(Template, Match) ->
-    {Front0, Token, Back} = split_template_(Template, Match),
-    Front1 = case Front0 of
-                 <<>> -> undefined;
-                 _    -> erl_syntax:abstract(Front0)
-             end,
-    {Front1, Token, Back}.
-
-split_template_(Template, [{-1, 0}, Rest]) ->
-    split_template_(Template, [none, Rest]);
-split_template_(Template, [{Left, 1} | Rest]) ->
-    split_template_(Template, [binary:at(Template, Left) | Rest]);
-split_template_(Template, [Left, {Right, 1} | Rest]) when is_integer(Left) ->
+split_template(Template, [{-1, 0}, Rest]) ->
+    split_template(Template, [none, Rest]);
+split_template(Template, [{Left, 1} | Rest]) ->
+    split_template(Template, [binary:at(Template, Left) | Rest]);
+split_template(Template, [Left, {Right, 1} | Rest]) when is_integer(Left) ->
     true = matching(Left, binary:at(Template, Right)),
-    split_template_(Template, [Left | Rest]);
-split_template_(Template, [Type, {{Start, Size}, {TagStart, TagSize}}]) ->
+    split_template(Template, [Left | Rest]);
+split_template(Template, [Type, {{Start, Size}, {TagStart, TagSize}}]) ->
     Front = erlang:binary_part(Template, 0, Start),
     Tag = erlang:binary_part(Template, TagStart, TagSize),
     BackStart = Start + Size,
     BackSize = byte_size(Template) - BackStart,
     Back = erlang:binary_part(Template, BackStart, BackSize),
-    Token = parse_tag(Type, Tag),
+    Token = token(Type, Tag),
     {Front, Token, Back}.
 
-parse_tag(none, Tag) -> {escaped, parse_key(Tag)};
-parse_tag($#, Tag) -> {section, parse_key(Tag)};
-parse_tag($^, Tag) -> {inverted_section, parse_key(Tag)};
-parse_tag($/, Tag) -> {end_section, parse_key(Tag)};
-parse_tag(${, Tag) -> {unescaped, parse_key(Tag)};
-parse_tag($&, Tag) -> {unescaped, parse_key(Tag)};
-parse_tag($!, Comment) -> {comment, Comment};
-parse_tag($=, Delimiters) ->
+token(none, Tag) -> {escaped, parse_key(Tag)};
+token($#, Tag) -> {section, parse_key(Tag)};
+token($^, Tag) -> {inverted_section, parse_key(Tag)};
+token($/, Tag) -> {end_section, parse_key(Tag)};
+token(${, Tag) -> {unescaped, parse_key(Tag)};
+token($&, Tag) -> {unescaped, parse_key(Tag)};
+token($!, Comment) -> {comment, Comment};
+token($=, Delimiters) ->
     [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
     {delimiters, Left, Right}.
 
@@ -238,16 +160,18 @@ escape_string(String) -> lists:map(fun (Char) -> [$\\, Char] end, String).
 
 -ifdef(EUNIT).
 
-compile_test_() ->
-    CompileTest = fun (Template) -> erl_prettypr:format(compile(Template)) end,
+parse_test_() ->
     [?_assertEqual(
-        "fun (Ctx0) -> [<<116, 101, 115, 116>>] end",
-        CompileTest(<<"test">>)
-     ),
-     ?_assertEqual(
-        "fun (Ctx0) -> [escape(mustache:get_binary([<<97>>], [Ctx0]))] end",
-        CompileTest(<<"{{a}}">>)
-     )].
+        [
+         {section, [<<"a">>],
+          [
+           {section, [<<"aa">>], [{escaped, [<<"x">>]}]},
+           {section, [<<"ab">>], [{unescaped, [<<"y">>]}]}
+          ]},
+         {inverted_section, [<<"b">>], [{escaped, [<<"z">>]}]}
+        ],
+        parse(<<"{{#a}}{{#aa}}{{x}}{{/aa}}{{#ab}}{{&y}}{{/ab}}{{/a}}{{^b}}{{z}}{{/b}}">>)
+       )].
 
 tokenize_test_() ->
     [?_assertEqual(
