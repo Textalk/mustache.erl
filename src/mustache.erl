@@ -21,7 +21,7 @@
 %% THE SOFTWARE.
 
 -module(mustache).
--export([parse/1, tokenize/1, get/2, get_binary/2, escape/1]).
+-export([render/2, compile/1, get/2, get_binary/2, get_escaped_binary/2]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -34,6 +34,9 @@ get_binary(Key, Contexts) ->
         undefined   -> <<>>;
         {ok, Value} -> to_binary(Value)
     end.
+
+get_escaped_binary(Key, Contexts) ->
+    escape(get_binary(Key, Contexts)).
 
 context_get(_Path, []) ->
     undefined;
@@ -65,6 +68,81 @@ escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
 escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
 escape([X | Rest], Acc)  -> escape(Rest, [X | Acc]).
 
+render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
+    Render = compile(Template),
+    Render(Ctx);
+render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
+    Render(Ctx).
+
+compile(Template) when is_binary(Template) ->
+    compile_(parse(Template)).
+
+compile_(Mustache) when is_list(Mustache) ->
+    %% fun (V1) ->
+    %%     C0 = [],
+    %%     erlang:iolist_to_binary(@Body@)
+    %% end.
+    Ctxs = var("C", 0),
+    Var = var("V", 1),
+    Match = erl_syntax:match_expr(Ctxs, erl_syntax:nil()),
+    Body = erl_syntax:application(
+             erl_syntax:atom(erlang),
+             erl_syntax:atom(iolist_to_binary),
+             compile_body(Mustache, Var, Ctxs, 1)
+            ),
+    FunST = erl_syntax:fun_expr([erl_syntax:clause([Var], [], [Match, Body])]),
+    FunExpr = erl_syntax:revert(FunST),
+    {value, Fun, _Bindings} = erl_eval:expr(FunExpr, erl_eval:new_bindings()),
+    Fun.
+
+compile_body(Mustache, Var, PrevCtxs, Depth) ->
+    %% begin
+    %%     C[Depth] = [V[Depth] | C[Depth-1]],
+    %%     [... Body...]
+    %% end
+    Ctxs = var("C", Depth),
+    Match = erl_syntax:match_expr(Ctxs, erl_syntax:list([Var], PrevCtxs)),
+    Body = [compile_tag(Tag, Ctxs, Depth) || Tag <- Mustache],
+    [erl_syntax:block_expr([Match, erl_syntax:list(Body)])].
+
+compile_tag(Binary, _Ctxs, _Depth) when is_binary(Binary) ->
+    erl_syntax:abstract(Binary);
+compile_tag({unescaped, Key}, Ctxs, _Depth) ->
+    %% mustache:get_binary(Key, C[Depth])
+    erl_syntax:application(
+      erl_syntax:atom(?MODULE),
+      erl_syntax:atom(get_binary),
+      [erl_syntax:abstract(Key), Ctxs]
+     );
+compile_tag({escaped, Key}, Ctxs, _Depth) ->
+    %% mustache:get_escaped_binary(Key, C[Depth])
+    erl_syntax:application(
+      erl_syntax:atom(?MODULE),
+      erl_syntax:atom(get_escaped_binary),
+      [erl_syntax:abstract(Key), Ctxs]
+     ).
+%compile_tag({section, Key, Mustache}, Ctxs, Depth) ->
+%    %% case mustache:get(Key, C[Depth]) of
+%    %%     undefined ->
+%    %%         <<>>;
+%    %%     {ok, V[Depth+1]} ->
+%    %%         case V[Depth+1] of
+%    %%             V[Depth+1] when V[Depth+1] =:= [];
+%    %%                             V[Depth+1] =:= false ->
+%    %%                 <<>>;
+%    %%             VL[Depth+1] when is_list(VL[Depth+1]) ->
+%    %%                 [Body[Depth+1] || V[Depth+1] <- VL[Depth+1]];
+%    %%             V[Depth+1] ->
+%    %%                 Body[Depth+1]
+%    %%
+%    %%
+%    undefined;
+%compile_tag({inverted_section, Key, Mustache}, Ctx, Depth) ->
+%    undefined.
+
+var(Prefix, Depth) when is_list(Prefix), is_integer(Depth) ->
+    erl_syntax:variable(Prefix ++ integer_to_list(Depth)).
+
 parse(Template) when is_binary(Template) ->
     parse(tokenize(Template));
 parse(Tokens) when is_list(Tokens) ->
@@ -74,6 +152,8 @@ parse([], [], Acc) ->
     lists:reverse(Acc);
 parse([Token | Rest], Path, Acc) ->
     case Token of
+        Binary when is_binary(Binary) ->
+            parse(Rest, Path, [Binary | Acc]);
         {Section, Key} when Section =:= section;
                             Section =:= inverted_section ->
             {Body, AfterSection} = parse(Rest, [Key | Path], []),
@@ -148,7 +228,7 @@ matching(_,  _)  -> false.
 compile_regexp(Left0, Right0) ->
     {Left1, Right1} = tag_start_end(Left0, Right0),
     TagRE = ["(", Left1, "({|=)(.+?)(}|=)", Right1, ")|(", Left1, "(#|\\^|!|&|/)?\\s*(.+?)", Right1, ")"],
-    {ok, CompiledTagRE} = re:compile(TagRE, [unicode]),
+    {ok, CompiledTagRE} = re:compile(TagRE, [unicode, dotall]),
     CompiledTagRE.
 
 tag_start_end(Left, Right) ->
@@ -160,6 +240,9 @@ escape_string(String) -> lists:map(fun (Char) -> [$\\, Char] end, String).
 
 -ifdef(EUNIT).
 
+mustache() ->
+    <<"{{#a}}{{#aa}}{{x}}{{/aa}}{{#ab}}{{&y}}{{/ab}}{{/a}}{{=[[ ]]=}}[[^b]][[z]][[/b]]">>.
+
 parse_test_() ->
     [?_assertEqual(
         [
@@ -170,7 +253,7 @@ parse_test_() ->
           ]},
          {inverted_section, [<<"b">>], [{escaped, [<<"z">>]}]}
         ],
-        parse(<<"{{#a}}{{#aa}}{{x}}{{/aa}}{{#ab}}{{&y}}{{/ab}}{{/a}}{{^b}}{{z}}{{/b}}">>)
+        parse(mustache())
        )].
 
 tokenize_test_() ->
