@@ -161,5 +161,5 @@ tag_type_comment_multiline_test() ->
     test_helper(<<"{{!\ncomment\ncomment\ncomment\n\n}}">>, <<>>, #{}).
 
 test_helper(Template, Expected, Ctx) ->
-    Result = iolist_to_binary(mustache:render(Template, Ctx)),
+    Result = mustache:render(Template, Ctx),
     ?assertEqual(Expected, Result).

@@ -21,22 +21,30 @@
 %% THE SOFTWARE.
 
 -module(mustache).
--export([render/2, compile/1, get/2, get_binary/2, get_escaped_binary/2]).
+-export([render/2, compile/1, get/2, to_binary/2]).
 
 -include_lib("eunit/include/eunit.hrl").
 
+-record(state, {
+          path  = []                                 :: [[binary()]],
+          depth = 0                                  :: non_neg_integer(),
+          ctx                                        :: erl_syntax:synaxTree(),
+          re    = compile_regexp(<<"{{">>, <<"}}">>) :: re:mp(),
+          ix    = 0                                  :: non_neg_integer()
+         }).
+
+-define(VAR(N), erl_syntax:variable(N)).
+-define(ABS(T), erl_syntax:abstract(T)).
+-define(APP(M, F, A), erl_syntax:application(erl_syntax:atom(M), erl_syntax:atom(F), A)).
+-define(BIN(Start, Length), ?APP(erlang, binary_part, [?VAR('Template'), ?ABS(Start), ?ABS(Length)])).
+-define(LIST(I), erl_syntax:list(I)).
+-define(GET(Key, Ctx), ?APP(?MODULE, get, [?ABS(Key), Ctx])).
+-define(GETB(Key, Ctx, Escaped), ?APP(?MODULE, to_binary, [?GET(Key, Ctx), ?ABS(Escaped)])).
+-define(ADD(Ctx, Var, Prev), erl_syntax:match_expr(Ctx, erl_syntax:list([Var], Prev))).
+-define(CASE(Expr, Clauses), erl_syntax:case_expr(Expr, Clauses)).
 
 get([], [Item | _Contexts]) -> {ok, Item};
 get(Key, Contexts)          -> context_get(Key, Contexts).
-
-get_binary(Key, Contexts) ->
-    case get(Key, Contexts) of
-        undefined   -> <<>>;
-        {ok, Value} -> to_binary(Value)
-    end.
-
-get_escaped_binary(Key, Contexts) ->
-    escape(get_binary(Key, Contexts)).
 
 context_get(_Path, []) ->
     undefined;
@@ -53,6 +61,10 @@ get_path([Key | Keys], Map) when is_map(Map) ->
         {ok, Value} -> get_path(Keys, Value);
         error       -> undefined
     end.
+
+to_binary({ok, Value}, true)   -> escape(to_binary(Value));
+to_binary({ok, Value}, false)  -> to_binary(Value);
+to_binary(undefined, _Escaped) -> <<>>.
 
 to_binary(Value) when is_integer(Value) -> integer_to_binary(Value);
 to_binary(Value) when is_float(Value)   -> float_to_binary(Value, [{decimals, 2}]);
@@ -74,133 +86,128 @@ render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
 render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
     Render(Ctx).
 
+var(Prefix, Depth) when is_list(Prefix), is_integer(Depth) ->
+    ?VAR(Prefix ++ integer_to_list(Depth)).
+
+compile(Template) when is_list(Template) ->
+    compile(unicode:characters_to_binary(Template));
 compile(Template) when is_binary(Template) ->
-    Mustache = parse(Template),
-    %% fun (V1) ->
-    %%     T = Template,
-    %%     C0 = [],
-    %%     erlang:iolist_to_binary(@Body@)
-    %% end.
-    Ctxs = var("C", 0),
-    Var = var("V", 1),
-    Match = erl_syntax:match_expr(Ctxs, erl_syntax:nil()),
-    Body = erl_syntax:application(
-             erl_syntax:atom(erlang),
-             erl_syntax:atom(iolist_to_binary),
-             compile_body(Mustache, Var, Ctxs, 1)
-            ),
-    FunST = erl_syntax:fun_expr([erl_syntax:clause([Var], [], [Match, Body])]),
+    State = #state{ctx = var("C", 0)},
+    Ctx = ?VAR('Ctx'),
+    Match = ?ADD(State#state.ctx, Ctx, erl_syntax:nil()),
+    Body = ?APP(erlang, iolist_to_binary, compile(Template, State, [])),
+    FunST = erl_syntax:fun_expr([erl_syntax:clause([Ctx], [], [Match, Body])]),
     FunExpr = erl_syntax:revert(FunST),
     Bindings0 = erl_eval:new_bindings(),
-    Bindings1 = erl_eval:add_binding('T', Template, Bindings0),
+    Bindings1 = erl_eval:add_binding('Template', Template, Bindings0),
     {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings1),
     Render.
 
-compile_body(Mustache, Var, PrevCtxs, Depth) ->
-    %% begin
-    %%     C[Depth] = [V[Depth] | C[Depth-1]],
-    %%     [... Body...]
-    %% end
-    Ctxs = var("C", Depth),
-    Match = erl_syntax:match_expr(Ctxs, erl_syntax:list([Var], PrevCtxs)),
-    Body = [compile_tag(Tag, Ctxs, Depth) || Tag <- Mustache],
-    [erl_syntax:block_expr([Match, erl_syntax:list(Body)])].
-
-compile_tag({binary, Start, Length}, _Ctxs, _Depth)
-  when is_integer(Start), Start > 0, is_integer(Length), Length > 1 ->
-    %% erlang:binary_part(Binary, Start, Length)
-    erl_syntax:application(
-      erl_syntax:atom(erlang),
-      erl_syntax:atom(binary_part),
-      [
-       erl_syntax:variable('T'),
-       erl_syntax:abstract(Start),
-       erl_syntax:abstract(Length)
-      ]
-     );
-compile_tag({unescaped, Key}, Ctxs, _Depth) ->
-    %% mustache:get_binary(Key, C[Depth])
-    erl_syntax:application(
-      erl_syntax:atom(?MODULE),
-      erl_syntax:atom(get_binary),
-      [erl_syntax:abstract(Key), Ctxs]
-     );
-compile_tag({escaped, Key}, Ctxs, _Depth) ->
-    %% mustache:get_escaped_binary(Key, C[Depth])
-    erl_syntax:application(
-      erl_syntax:atom(?MODULE),
-      erl_syntax:atom(get_escaped_binary),
-      [erl_syntax:abstract(Key), Ctxs]
-     ).
-%compile_tag({section, Key, Mustache}, Ctxs, Depth) ->
-%    %% case mustache:get(Key, C[Depth]) of
-%    %%     undefined ->
-%    %%         <<>>;
-%    %%     {ok, V[Depth+1]} ->
-%    %%         case V[Depth+1] of
-%    %%             V[Depth+1] when V[Depth+1] =:= [];
-%    %%                             V[Depth+1] =:= false ->
-%    %%                 <<>>;
-%    %%             VL[Depth+1] when is_list(VL[Depth+1]) ->
-%    %%                 [Body[Depth+1] || V[Depth+1] <- VL[Depth+1]];
-%    %%             V[Depth+1] when is_function(V[Depth+1], 1) ->
-%    %%                 mustache:render(V[Depth+1](Section), C[Depth]);
-%    %%             V[Depth+1] ->
-%    %%                 Body[Depth+1]
-%    %%         end
-%    %% end
-%    %%
-%    undefined;
-%compile_tag({inverted_section, Key, Mustache}, Ctx, Depth) ->
-%    undefined.
-
-var(Prefix, Depth) when is_list(Prefix), is_integer(Depth) ->
-    erl_syntax:variable(Prefix ++ integer_to_list(Depth)).
-
-parse(Template) when is_binary(Template) ->
-    parse(tokenize(Template));
-parse(Tokens) when is_list(Tokens) ->
-  parse(Tokens, [], []).
-
-parse([], [], Acc) ->
-    lists:reverse(Acc);
-parse([Token | Rest], Path, Acc) ->
-    case Token of
-        Binary when is_binary(Binary) ->
-            parse(Rest, Path, [Binary | Acc]);
-        {Section, Key} when Section =:= section;
-                            Section =:= inverted_section ->
-            {Body, AfterSection} = parse(Rest, [Key | Path], []),
-            parse(AfterSection, Path, [{Section, Key, Body} | Acc]);
-        {end_section, Key} when Key =:= hd(Path) ->
-            {lists:reverse(Acc), Rest};
-        {Tag, _Key} when Tag =:= escaped;
-                         Tag =:= unescaped ->
-            parse(Rest, Path, [Token | Acc])
-    end.
-
-tokenize(Template) ->
-    Regexp = compile_regexp(<<"{{">>, <<"}}">>),
-    tokenize(Template, Regexp, []).
-
-tokenize(<<>>, _Regexp, Acc) ->
-  lists:reverse(Acc);
-tokenize(Template, Regexp, Acc0) ->
-    case re:run(Template, Regexp) of
+compile(<<>>, #state{path = []}, Acc) ->
+  [?LIST(lists:reverse(Acc))];
+compile(Rest, State0, Acc0) ->
+    #state{ix = Ix0, re = Re0, ctx = Ctx0, path = Path, depth = Depth} = State0,
+    case re:run(Rest, Re0) of
         nomatch ->
-            tokenize(<<>>, Regexp, [Template | Acc0]);
+            Size = byte_size(Rest),
+            State1 = State0#state{ix = Ix0 + Size},
+            compile(<<>>, State1, [?BIN(Ix0, Size) | Acc0]);
         {match, Match} ->
-            {Front, Tag, Back} = split_template(Template, fix_match(Match)),
-            Acc1 = case Front of
-                     <<>> -> Acc0;
-                     _    -> [Front | Acc0]
-                   end,
+            {FrontLength, Tag, Back, Total} = split_template(Rest, fix_match(Match)),
+            #state{ix = Ix1} = State1 = State0#state{ix = Ix0 + Total},
+            Acc1 = case FrontLength of 0 -> Acc0; _ -> [?BIN(Ix0, FrontLength) | Acc0] end,
             case Tag of
-              {delimiters, Left, Right} -> tokenize(Back, compile_regexp(Left, Right), Acc1);
-              {comment, _Comment}       -> tokenize(Back, Regexp, Acc1);
-              _                         -> tokenize(Back, Regexp, [Tag | Acc1])
+                {tag, Escaped, Key} ->
+                    Acc2 = [?GETB(Key, Ctx0, Escaped) | Acc1],
+                    compile(Back, State1, Acc2);
+                {section, Inverted, Key} ->
+                    Next = Depth + 1,
+                    InnerState = State1#state{
+                                   depth = Next,
+                                   path  = [Key | Path],
+                                   ctx   = var("C", Next)
+                                  },
+                    {Inner, End, Rest1, Ix2} = compile(Back, InnerState, []),
+                    Size = End - Ix1,
+                    State2 = State1#state{ix = Ix2},
+                    Section = case Inverted of
+                                  false -> compile_section(Key, Depth, Inner, Ix1, Size);
+                                  true  -> compile_inverted_section(Key, Depth, Inner)
+                              end,
+                    compile(Rest1, State2, [Section | Acc1]);
+                {end_section, Key} when hd(Path) =:= Key ->
+                    {?LIST(lists:reverse(Acc1)), Ix0 + FrontLength, Back, Ix1};
+                {delimiters, Left, Right} ->
+                    State2 = State1#state{re = compile_regexp(Left, Right)},
+                    compile(Back, State2, Acc1);
+                {comment, _Comment} ->
+                    compile(Back, State1, Acc1)
             end
     end.
+
+compile_section(Key, Depth, Inner0, Start, Size) ->
+    Var = var("V", Depth),
+    {Ctx1, Ctx0} = {var("C", Depth + 1), var("C", Depth)},
+    Match = erl_syntax:match_expr(Ctx1, erl_syntax:list([Var], Ctx0)),
+    Inner1 = erl_syntax:block_expr([Match, Inner0]),
+    Val = var("Val", Depth),
+    List = var("VL", Depth),
+    Binary = erl_syntax:application(
+               erl_syntax:atom(binary_part),
+               [erl_syntax:variable('Template'),
+                erl_syntax:integer(Start),
+                erl_syntax:integer(Size)]
+              ),
+    Function = erl_syntax:application(
+                 erl_syntax:atom(?MODULE),
+                 erl_syntax:atom(render),
+                 [
+                  erl_syntax:application(
+                    none,
+                    erl_syntax:atom(apply),
+                    [Var, erl_syntax:list([Binary])]
+                   ),
+                  erl_syntax:application(none, erl_syntax:atom(hd), [Ctx0])
+                 ]
+                ),
+    InnerCase = erl_syntax:case_expr(
+                  Val,
+                  [
+                   erl_syntax:clause([erl_syntax:underscore()], false_guard(Val), [erl_syntax:nil()]),
+                   erl_syntax:clause([List],
+                                     [erl_syntax:application(none, erl_syntax:atom(is_list), [List])],
+                                     [erl_syntax:list_comp(Inner1, [erl_syntax:generator(Var, List)])]),
+                   erl_syntax:clause([Var],
+                                     [erl_syntax:application(none, erl_syntax:atom(is_function), [Var, erl_syntax:integer(1)])],
+                                     [Function]),
+                   erl_syntax:clause([Var], [], [Inner1])
+                  ]
+                 ),
+    erl_syntax:case_expr(
+      ?GET(Key, Ctx0),
+      [
+       erl_syntax:clause([erl_syntax:atom(undefined)], [], [erl_syntax:nil()]),
+       erl_syntax:clause([erl_syntax:tuple([erl_syntax:atom(ok), Val])], [], [InnerCase])
+      ]
+     ).
+
+compile_inverted_section(Key, Depth, Inner0) ->
+    {Ctx1, Ctx0} = {var("C", Depth + 1), var("C", Depth)},
+    Val = var("Val", Depth),
+    Inner1 = [erl_syntax:match_expr(Ctx1, Ctx0), Inner0],
+    erl_syntax:case_expr(
+      ?GET(Key, Ctx0),
+      [
+       erl_syntax:clause([erl_syntax:atom(undefined)], [], Inner1),
+       erl_syntax:clause([erl_syntax:tuple([erl_syntax:atom(ok), Val])], false_guard(Val), Inner1),
+       erl_syntax:clause([erl_syntax:underscore()], [], [erl_syntax:nil()])
+      ]
+     ).
+
+false_guard(Var) ->
+    ExactlyEqual = erl_syntax:operator('=:='),
+    erl_syntax:disjunction([erl_syntax:infix_expr(Var, ExactlyEqual, erl_syntax:atom(false)),
+                            erl_syntax:infix_expr(Var, ExactlyEqual, erl_syntax:nil())]).
 
 fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
 fix_match([_, Total, Left, Tag, Right]) -> [Left, Right, {Total, Tag}];
@@ -214,20 +221,19 @@ split_template(Template, [Left, {Right, 1} | Rest]) when is_integer(Left) ->
     true = matching(Left, binary:at(Template, Right)),
     split_template(Template, [Left | Rest]);
 split_template(Template, [Type, {{Start, Size}, {TagStart, TagSize}}]) ->
-    Front = erlang:binary_part(Template, 0, Start),
     Tag = erlang:binary_part(Template, TagStart, TagSize),
     BackStart = Start + Size,
     BackSize = byte_size(Template) - BackStart,
     Back = erlang:binary_part(Template, BackStart, BackSize),
     Token = token(Type, Tag),
-    {Front, Token, Back}.
+    {Start, Token, Back, BackStart}.
 
-token(none, Tag) -> {escaped, parse_key(Tag)};
-token($#, Tag) -> {section, parse_key(Tag)};
-token($^, Tag) -> {inverted_section, parse_key(Tag)};
+token(none, Tag) -> {tag, true, parse_key(Tag)};
+token($#, Tag) -> {section, false, parse_key(Tag)};
+token($^, Tag) -> {section, true, parse_key(Tag)};
 token($/, Tag) -> {end_section, parse_key(Tag)};
-token(${, Tag) -> {unescaped, parse_key(Tag)};
-token($&, Tag) -> {unescaped, parse_key(Tag)};
+token(${, Tag) -> {tag, false, parse_key(Tag)};
+token($&, Tag) -> {tag, false, parse_key(Tag)};
 token($!, Comment) -> {comment, Comment};
 token($=, Delimiters) ->
     [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
@@ -251,51 +257,3 @@ tag_start_end(Left, Right) ->
     {escape_string(LeftStr), escape_string(RightStr)}.
 
 escape_string(String) -> lists:map(fun (Char) -> [$\\, Char] end, String).
-
--ifdef(EUNIT).
-
-mustache() ->
-    <<"{{#a}}{{#aa}}{{x}}{{/aa}}{{#ab}}{{&y}}{{/ab}}{{/a}}{{=[[ ]]=}}[[^b]][[z]][[/b]]">>.
-
-parse_test_() ->
-    [?_assertEqual(
-        [
-         {section, [<<"a">>],
-          [
-           {section, [<<"aa">>], [{escaped, [<<"x">>]}]},
-           {section, [<<"ab">>], [{unescaped, [<<"y">>]}]}
-          ]},
-         {inverted_section, [<<"b">>], [{escaped, [<<"z">>]}]}
-        ],
-        parse(mustache())
-       )].
-
-tokenize_test_() ->
-    [?_assertEqual(
-        [<<"a">>, {escaped, [<<"apa">>]}, <<"b">>, {escaped, [<<"bepa">>]}, <<"c">>, {escaped, [<<"cepa">>]}, <<"d">>],
-        tokenize(<<"a{{apa}}b{{bepa}}c{{cepa}}d">>)
-       ),
-     ?_assertEqual(
-        [{escaped, [<<"a">>]}, {unescaped, [<<"b">>]}, {section, [<<"c">>]}, {inverted_section, [<<"d">>]},
-         {end_section, [<<"e">>]}, {unescaped, [<<"g">>]}],
-        tokenize(<<"{{a}}{{{b}}}{{#c}}{{^d}}{{/e}}{{!f}}{{=[[ ]]=}}[[&g]]">>)
-       )
-    ].
-
-compile_regexp_test_() ->
-    TagRE = compile_regexp(<<"{{">>, <<"}}">>),
-    TestTagRE = fun (Template) -> fix_match(element(2, re:run(Template, TagRE))) end,
-
-    [
-     %% Tag
-     ?_assertEqual([{-1, 0}, {{1, 7}, {3, 3}}], TestTagRE(<<"X{{apa}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {7, 1}, {{1, 9}, {4, 3}}], TestTagRE(<<"X{{{apa}}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {7, 1}, {{1, 9}, {4, 3}}], TestTagRE(<<"X{{=apa=}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{#apa}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{^apa}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{!apa}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {{1, 8}, {4, 3}}], TestTagRE(<<"X{{/apa}}Y{{bepa}}Z">>)),
-     ?_assertEqual([{3, 1}, {{1, 10}, {6, 3}}], TestTagRE(<<"X{{#  apa}}Y{{bepa}}Z">>))
-    ].
-
--endif.
