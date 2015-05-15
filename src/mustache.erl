@@ -23,25 +23,16 @@
 -module(mustache).
 -export([render/2, compile/1, get/2, to_binary/2]).
 
+-include("mustache.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -record(state, {
           path  = []                                 :: [[binary()]],
           depth = 0                                  :: non_neg_integer(),
-          ctx                                        :: erl_syntax:synaxTree(),
+          ctx   = ?VAR("C", 0)                       :: erl_syntax:synaxTree(),
           re    = compile_regexp(<<"{{">>, <<"}}">>) :: re:mp(),
           ix    = 0                                  :: non_neg_integer()
          }).
-
--define(VAR(N), erl_syntax:variable(N)).
--define(ABS(T), erl_syntax:abstract(T)).
--define(APP(M, F, A), erl_syntax:application(erl_syntax:atom(M), erl_syntax:atom(F), A)).
--define(BIN(Start, Length), ?APP(erlang, binary_part, [?VAR('Template'), ?ABS(Start), ?ABS(Length)])).
--define(LIST(I), erl_syntax:list(I)).
--define(GET(Key, Ctx), ?APP(?MODULE, get, [?ABS(Key), Ctx])).
--define(GETB(Key, Ctx, Escaped), ?APP(?MODULE, to_binary, [?GET(Key, Ctx), ?ABS(Escaped)])).
--define(ADD(Ctx, Var, Prev), erl_syntax:match_expr(Ctx, erl_syntax:list([Var], Prev))).
--define(CASE(Expr, Clauses), erl_syntax:case_expr(Expr, Clauses)).
 
 get([], [Item | _Contexts]) -> {ok, Item};
 get(Key, Contexts)          -> context_get(Key, Contexts).
@@ -78,7 +69,7 @@ escape([], Acc)          -> unicode:characters_to_binary(lists:reverse(Acc));
 escape([$< | Rest], Acc) -> escape(Rest, [<<"&lt;">> | Acc]);
 escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
 escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
-escape([X | Rest], Acc)  -> escape(Rest, [X | Acc]).
+escape([C  | Rest], Acc)  -> escape(Rest, [C | Acc]).
 
 render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
     Render = compile(Template),
@@ -86,20 +77,17 @@ render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
 render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
     Render(Ctx).
 
-var(Prefix, Depth) when is_list(Prefix), is_integer(Depth) ->
-    ?VAR(Prefix ++ integer_to_list(Depth)).
-
 compile(Template) when is_list(Template) ->
     compile(unicode:characters_to_binary(Template));
 compile(Template) when is_binary(Template) ->
-    State = #state{ctx = var("C", 0)},
-    Ctx = ?VAR('Ctx'),
-    Match = ?ADD(State#state.ctx, Ctx, erl_syntax:nil()),
+    State = #state{},
+    Arg = ?VAR('C'),
+    Match = ?MATCH(State#state.ctx, ?LIST([Arg])),
     Body = ?APP(erlang, iolist_to_binary, compile(Template, State, [])),
-    FunST = erl_syntax:fun_expr([erl_syntax:clause([Ctx], [], [Match, Body])]),
+    FunST = ?FUN([?CLAUSE([Arg], [?APP(is_map, [Arg])], [Match, Body])]),
     FunExpr = erl_syntax:revert(FunST),
     Bindings0 = erl_eval:new_bindings(),
-    Bindings1 = erl_eval:add_binding('Template', Template, Bindings0),
+    Bindings1 = erl_eval:add_binding('T', Template, Bindings0),
     {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings1),
     Render.
 
@@ -113,30 +101,36 @@ compile(Rest, State0, Acc0) ->
             State1 = State0#state{ix = Ix0 + Size},
             compile(<<>>, State1, [?BIN(Ix0, Size) | Acc0]);
         {match, Match} ->
-            {FrontLength, Tag, Back, Total} = split_template(Rest, fix_match(Match)),
+            {PrefixLength, Tag, Back, Total} = split(Rest, Match),
             #state{ix = Ix1} = State1 = State0#state{ix = Ix0 + Total},
-            Acc1 = case FrontLength of 0 -> Acc0; _ -> [?BIN(Ix0, FrontLength) | Acc0] end,
+            Acc1 = case PrefixLength of
+                       0 -> Acc0;
+                       _ -> [?BIN(Ix0, PrefixLength) | Acc0]
+                   end,
             case Tag of
                 {tag, Escaped, Key} ->
-                    Acc2 = [?GETB(Key, Ctx0, Escaped) | Acc1],
+                    Acc2 = [?TOBIN(?GET(Key, Ctx0), Escaped) | Acc1],
                     compile(Back, State1, Acc2);
                 {section, Inverted, Key} ->
                     Next = Depth + 1,
                     InnerState = State1#state{
                                    depth = Next,
                                    path  = [Key | Path],
-                                   ctx   = var("C", Next)
+                                   ctx   = ?VAR("C", Next)
                                   },
                     {Inner, End, Rest1, Ix2} = compile(Back, InnerState, []),
                     Size = End - Ix1,
                     State2 = State1#state{ix = Ix2},
                     Section = case Inverted of
-                                  false -> compile_section(Key, Depth, Inner, Ix1, Size);
-                                  true  -> compile_inverted_section(Key, Depth, Inner)
+                                  false ->
+                                      Binary = ?BIN(Ix1, Size),
+                                      compile_section(Key, Depth, Inner, Binary);
+                                  true ->
+                                      compile_inverted_section(Key, Depth, Inner)
                               end,
                     compile(Rest1, State2, [Section | Acc1]);
                 {end_section, Key} when hd(Path) =:= Key ->
-                    {?LIST(lists:reverse(Acc1)), Ix0 + FrontLength, Back, Ix1};
+                    {?LIST(lists:reverse(Acc1)), Ix0 + PrefixLength, Back, Ix1};
                 {delimiters, Left, Right} ->
                     State2 = State1#state{re = compile_regexp(Left, Right)},
                     compile(Back, State2, Acc1);
@@ -145,69 +139,47 @@ compile(Rest, State0, Acc0) ->
             end
     end.
 
-compile_section(Key, Depth, Inner0, Start, Size) ->
-    Var = var("V", Depth),
-    {Ctx1, Ctx0} = {var("C", Depth + 1), var("C", Depth)},
-    Match = erl_syntax:match_expr(Ctx1, erl_syntax:list([Var], Ctx0)),
-    Inner1 = erl_syntax:block_expr([Match, Inner0]),
-    Val = var("Val", Depth),
-    List = var("VL", Depth),
-    Binary = erl_syntax:application(
-               erl_syntax:atom(binary_part),
-               [erl_syntax:variable('Template'),
-                erl_syntax:integer(Start),
-                erl_syntax:integer(Size)]
-              ),
-    Function = erl_syntax:application(
-                 erl_syntax:atom(?MODULE),
-                 erl_syntax:atom(render),
-                 [
-                  erl_syntax:application(
-                    none,
-                    erl_syntax:atom(apply),
-                    [Var, erl_syntax:list([Binary])]
-                   ),
-                  erl_syntax:application(none, erl_syntax:atom(hd), [Ctx0])
-                 ]
-                ),
-    InnerCase = erl_syntax:case_expr(
-                  Val,
-                  [
-                   erl_syntax:clause([erl_syntax:underscore()], false_guard(Val), [erl_syntax:nil()]),
-                   erl_syntax:clause([List],
-                                     [erl_syntax:application(none, erl_syntax:atom(is_list), [List])],
-                                     [erl_syntax:list_comp(Inner1, [erl_syntax:generator(Var, List)])]),
-                   erl_syntax:clause([Var],
-                                     [erl_syntax:application(none, erl_syntax:atom(is_function), [Var, erl_syntax:integer(1)])],
-                                     [Function]),
-                   erl_syntax:clause([Var], [], [Inner1])
-                  ]
+compile_section(Key, Depth, Inner0, Binary) ->
+    {Var, Val} = {?VAR("V", Depth), ?VAR("Val", Depth)},
+    {Ctx1, Ctx0} = {?VAR("C", Depth + 1), ?VAR("C", Depth)},
+    Inner1 = ?BLOCK([?MATCH(Ctx1, ?LIST([Var], Ctx0)), Inner0]),
+    RenderArgs = [?APP(apply, [Var, ?LIST([Binary])]), ?APP(hd, [Ctx0])],
+    Function = ?APP(?MODULE, render, RenderArgs),
+    Clauses = [
+               ?CLAUSE([?WILD], false_guard(Val), [?NIL]),
+               ?CLAUSE(
+                  [?WILD],
+                  [?APP(is_list, [Val])],
+                  [?LISTCOMP(Inner1, [?GEN(Var, Val)])]
                  ),
-    erl_syntax:case_expr(
-      ?GET(Key, Ctx0),
+               ?CLAUSE([Var], [?APP(is_function, [Var, ?INT(1)])], [Function]),
+               ?CLAUSE([Var], [], [Inner1])
+              ],
+    ?CASE(?GET(Key, Ctx0),
       [
-       erl_syntax:clause([erl_syntax:atom(undefined)], [], [erl_syntax:nil()]),
-       erl_syntax:clause([erl_syntax:tuple([erl_syntax:atom(ok), Val])], [], [InnerCase])
+       ?CLAUSE([?ATOM(undefined)], [], [?NIL]),
+       ?CLAUSE([?TUPLE([?ATOM(ok), Val])], [], [?CASE(Val, Clauses)])
       ]
      ).
 
 compile_inverted_section(Key, Depth, Inner0) ->
-    {Ctx1, Ctx0} = {var("C", Depth + 1), var("C", Depth)},
-    Val = var("Val", Depth),
-    Inner1 = [erl_syntax:match_expr(Ctx1, Ctx0), Inner0],
-    erl_syntax:case_expr(
+    {Ctx1, Ctx0} = {?VAR("C", Depth + 1), ?VAR("C", Depth)},
+    Val = ?VAR("Val", Depth),
+    Inner1 = [?MATCH(Ctx1, Ctx0), Inner0],
+    ?CASE(
       ?GET(Key, Ctx0),
       [
-       erl_syntax:clause([erl_syntax:atom(undefined)], [], Inner1),
-       erl_syntax:clause([erl_syntax:tuple([erl_syntax:atom(ok), Val])], false_guard(Val), Inner1),
-       erl_syntax:clause([erl_syntax:underscore()], [], [erl_syntax:nil()])
+       ?CLAUSE([?ATOM(undefined)], [], Inner1),
+       ?CLAUSE([?TUPLE([?ATOM(ok), Val])], false_guard(Val), Inner1),
+       ?CLAUSE([?WILD], [], [?NIL])
       ]
      ).
 
 false_guard(Var) ->
-    ExactlyEqual = erl_syntax:operator('=:='),
-    erl_syntax:disjunction([erl_syntax:infix_expr(Var, ExactlyEqual, erl_syntax:atom(false)),
-                            erl_syntax:infix_expr(Var, ExactlyEqual, erl_syntax:nil())]).
+    ?DISJUNCTION([?EQUAL(Var, ?ATOM(false)), ?EQUAL(Var, ?NIL)]).
+
+split(Template, Match) ->
+    split_template(Template, fix_match(Match)).
 
 fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
 fix_match([_, Total, Left, Tag, Right]) -> [Left, Right, {Total, Tag}];
@@ -239,7 +211,9 @@ token($=, Delimiters) ->
     [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
     {delimiters, Left, Right}.
 
-parse_key(Tag) -> re:split(Tag, <<"\\.">>, [trim, unicode]).
+parse_key(Tag) ->
+    Segments = re:split(Tag, <<"\\.">>, [trim, unicode]),
+    ?LIST(lists:map(fun erl_syntax:abstract/1, Segments)).
 
 matching(${, $}) -> true;
 matching($=, $=) -> true;
@@ -247,7 +221,9 @@ matching(_,  _)  -> false.
 
 compile_regexp(Left0, Right0) ->
     {Left1, Right1} = tag_start_end(Left0, Right0),
-    TagRE = ["(", Left1, "({|=)(.+?)(}|=)", Right1, ")|(", Left1, "(#|\\^|!|&|/)?\\s*(.+?)", Right1, ")"],
+    TagRE = ["(", Left1, "({|=)(.+?)(}|=)", Right1, ")"
+             "|"
+             "(", Left1, "(#|\\^|!|&|/)?\\s*(.+?)", Right1, ")"],
     {ok, CompiledTagRE} = re:compile(TagRE, [unicode, dotall]),
     CompiledTagRE.
 
