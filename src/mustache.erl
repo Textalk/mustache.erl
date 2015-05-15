@@ -75,10 +75,9 @@ render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
     Render(Ctx).
 
 compile(Template) when is_binary(Template) ->
-    compile_(parse(Template)).
-
-compile_(Mustache) when is_list(Mustache) ->
+    Mustache = parse(Template),
     %% fun (V1) ->
+    %%     T = Template,
     %%     C0 = [],
     %%     erlang:iolist_to_binary(@Body@)
     %% end.
@@ -92,8 +91,10 @@ compile_(Mustache) when is_list(Mustache) ->
             ),
     FunST = erl_syntax:fun_expr([erl_syntax:clause([Var], [], [Match, Body])]),
     FunExpr = erl_syntax:revert(FunST),
-    {value, Fun, _Bindings} = erl_eval:expr(FunExpr, erl_eval:new_bindings()),
-    Fun.
+    Bindings0 = erl_eval:new_bindings(),
+    Bindings1 = erl_eval:add_binding('T', Template, Bindings0),
+    {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings1),
+    Render.
 
 compile_body(Mustache, Var, PrevCtxs, Depth) ->
     %% begin
@@ -105,8 +106,18 @@ compile_body(Mustache, Var, PrevCtxs, Depth) ->
     Body = [compile_tag(Tag, Ctxs, Depth) || Tag <- Mustache],
     [erl_syntax:block_expr([Match, erl_syntax:list(Body)])].
 
-compile_tag(Binary, _Ctxs, _Depth) when is_binary(Binary) ->
-    erl_syntax:abstract(Binary);
+compile_tag({binary, Start, Length}, _Ctxs, _Depth)
+  when is_integer(Start), Start > 0, is_integer(Length), Length > 1 ->
+    %% erlang:binary_part(Binary, Start, Length)
+    erl_syntax:application(
+      erl_syntax:atom(erlang),
+      erl_syntax:atom(binary_part),
+      [
+       erl_syntax:variable('T'),
+       erl_syntax:abstract(Start),
+       erl_syntax:abstract(Length)
+      ]
+     );
 compile_tag({unescaped, Key}, Ctxs, _Depth) ->
     %% mustache:get_binary(Key, C[Depth])
     erl_syntax:application(
@@ -132,9 +143,12 @@ compile_tag({escaped, Key}, Ctxs, _Depth) ->
 %    %%                 <<>>;
 %    %%             VL[Depth+1] when is_list(VL[Depth+1]) ->
 %    %%                 [Body[Depth+1] || V[Depth+1] <- VL[Depth+1]];
+%    %%             V[Depth+1] when is_function(V[Depth+1], 1) ->
+%    %%                 mustache:render(V[Depth+1](Section), C[Depth]);
 %    %%             V[Depth+1] ->
 %    %%                 Body[Depth+1]
-%    %%
+%    %%         end
+%    %% end
 %    %%
 %    undefined;
 %compile_tag({inverted_section, Key, Mustache}, Ctx, Depth) ->
