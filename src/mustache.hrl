@@ -1,0 +1,26 @@
+-define(TEMPLATE, ?VAR('T')).
+-define(NIL, erl_syntax:nil()).
+-define(WILD, erl_syntax:underscore()).
+-define(VAR(N), erl_syntax:variable(N)).
+-define(VAR(P, I), ?VAR(P ++ integer_to_list(I))).
+-define(INT(I), erl_syntax:integer(I)).
+-define(ATOM(S), erl_syntax:atom(S)).
+-define(TUPLE(T), erl_syntax:tuple(T)).
+-define(APP(F, A), erl_syntax:application(none, ?ATOM(F), A)).
+-define(APP(M, F, A), erl_syntax:application(?ATOM(M), ?ATOM(F), A)).
+-define(BIN(S, L), ?APP(erlang, binary_part, [?TEMPLATE, ?INT(S), ?INT(L)])).
+-define(GEN(P, E), erl_syntax:generator(P, E)).
+-define(LIST(L), erl_syntax:list(L)).
+-define(LIST(L, T), erl_syntax:list(L, T)).
+-define(LISTCOMP(T, B), erl_syntax:list_comp(T, B)).
+-define(GET(K, C), ?APP(?MODULE, get, [K, C])).
+-define(TOBIN(T, E), ?APP(?MODULE, to_binary, [T, ?ATOM(E)])).
+-define(CASE(E, CS), erl_syntax:case_expr(E, CS)).
+-define(BLOCK(ES), erl_syntax:block_expr(ES)).
+-define(CLAUSE(P, G, B), erl_syntax:clause(P, G, B)).
+-define(MATCH(P, E), erl_syntax:match_expr(P, E)).
+-define(FUN(CS), erl_syntax:fun_expr(CS)).
+-define(DISJUNCTION(CS), erl_syntax:disjunction(CS)).
+-define(OP(O), erl_syntax:operator(O)).
+-define(INFIX(L, O, R), erl_syntax:infix_expr(L, ?OP(O), R)).
+-define(EQUAL(L, R), ?INFIX(L, '=:=', R)).
