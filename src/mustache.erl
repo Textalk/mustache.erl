@@ -27,11 +27,12 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -record(state, {
-          path  = []                                 :: [[binary()]],
-          depth = 0                                  :: non_neg_integer(),
-          ctx   = ?VAR("C", 0)                       :: erl_syntax:synaxTree(),
-          re    = compile_regexp(<<"{{">>, <<"}}">>) :: re:mp(),
-          ix    = 0                                  :: non_neg_integer()
+          path       = []                                 :: [[binary()]],
+          list_index = 1                                  :: pos_integer(),
+          depth      = 0                                  :: non_neg_integer(),
+          ctx        = ?VAR("C", 0, 1)                    :: erl_syntax:synaxTree(),
+          re         = compile_regexp(<<"{{">>, <<"}}">>) :: re:mp(),
+          ix         = 0                                  :: non_neg_integer()
          }).
 
 get([], [Item | _Contexts]) -> {ok, Item};
@@ -51,7 +52,9 @@ get_path([Key | Keys], Map) when is_map(Map) ->
     case maps:find(Key, Map) of
         {ok, Value} -> get_path(Keys, Value);
         error       -> undefined
-    end.
+    end;
+get_path(_Path, _Value) ->
+    undefined.
 
 to_binary({ok, Value}, true)   -> escape(to_binary(Value));
 to_binary({ok, Value}, false)  -> to_binary(Value);
@@ -94,7 +97,8 @@ compile(Template) when is_binary(Template) ->
 compile(<<>>, #state{path = []}, Acc) ->
   [?LIST(lists:reverse(Acc))];
 compile(Rest, State0, Acc0) ->
-    #state{ix = Ix0, re = Re0, ctx = Ctx0, path = Path, depth = Depth} = State0,
+    #state{ix = Ix0, re = Re0, ctx = Ctx0, path = Path, depth = Depth,
+           list_index = ListIx} = State0,
     case re:run(Rest, Re0) of
         nomatch ->
             Size = byte_size(Rest),
@@ -114,19 +118,20 @@ compile(Rest, State0, Acc0) ->
                 {section, Inverted, Key} ->
                     Next = Depth + 1,
                     InnerState = State1#state{
-                                   depth = Next,
-                                   path  = [Key | Path],
-                                   ctx   = ?VAR("C", Next)
+                                   depth      = Next,
+                                   path       = [Key | Path],
+                                   ctx        = ?VAR("C", Next, ListIx),
+                                   list_index = 1
                                   },
                     {Inner, End, Rest1, Ix2} = compile(Back, InnerState, []),
                     Size = End - Ix1,
-                    State2 = State1#state{ix = Ix2},
+                    State2 = State1#state{ix = Ix2, list_index = ListIx + 1},
                     Section = case Inverted of
                                   false ->
                                       Binary = ?BIN(Ix1, Size),
-                                      compile_section(Key, Depth, Inner, Binary);
+                                      compile_section(Key, Ctx0, Depth, ListIx, Inner, Binary);
                                   true ->
-                                      compile_inverted_section(Key, Depth, Inner)
+                                      compile_inverted_section(Key, Ctx0, Depth, ListIx, Inner)
                               end,
                     compile(Rest1, State2, [Section | Acc1]);
                 {end_section, Key} when hd(Path) =:= Key ->
@@ -139,9 +144,9 @@ compile(Rest, State0, Acc0) ->
             end
     end.
 
-compile_section(Key, Depth, Inner0, Binary) ->
-    {Var, Val} = {?VAR("V", Depth), ?VAR("Val", Depth)},
-    {Ctx1, Ctx0} = {?VAR("C", Depth + 1), ?VAR("C", Depth)},
+compile_section(Key, Ctx0, Depth, ListIx, Inner0, Binary) ->
+    {Var, Val} = {?VAR("V", Depth, ListIx), ?VAR("Val", Depth, ListIx)},
+    Ctx1 = ?VAR("C", Depth + 1, ListIx),
     Inner1 = ?BLOCK([?MATCH(Ctx1, ?LIST([Var], Ctx0)), Inner0]),
     RenderArgs = [?APP(apply, [Var, ?LIST([Binary])]), ?APP(hd, [Ctx0])],
     Function = ?APP(?MODULE, render, RenderArgs),
@@ -162,9 +167,9 @@ compile_section(Key, Depth, Inner0, Binary) ->
       ]
      ).
 
-compile_inverted_section(Key, Depth, Inner0) ->
-    {Ctx1, Ctx0} = {?VAR("C", Depth + 1), ?VAR("C", Depth)},
-    Val = ?VAR("Val", Depth),
+compile_inverted_section(Key, Ctx0, Depth, ListIx, Inner0) ->
+    Ctx1 = ?VAR("C", Depth + 1, ListIx),
+    Val = ?VAR("Val", Depth, ListIx),
     Inner1 = [?MATCH(Ctx1, Ctx0), Inner0],
     ?CASE(
       ?GET(Key, Ctx0),

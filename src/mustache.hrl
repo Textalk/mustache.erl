@@ -2,7 +2,7 @@
 -define(NIL, erl_syntax:nil()).
 -define(WILD, erl_syntax:underscore()).
 -define(VAR(N), erl_syntax:variable(N)).
--define(VAR(P, I), ?VAR(P ++ integer_to_list(I))).
+-define(VAR(P, I, J), ?VAR(P ++ "_" ++ integer_to_list(I) ++ "_" ++ integer_to_list(J))).
 -define(INT(I), erl_syntax:integer(I)).
 -define(ATOM(S), erl_syntax:atom(S)).
 -define(TUPLE(T), erl_syntax:tuple(T)).
