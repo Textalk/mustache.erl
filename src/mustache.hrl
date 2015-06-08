@@ -6,6 +6,7 @@
 -define(INT(I), erl_syntax:integer(I)).
 -define(ATOM(S), erl_syntax:atom(S)).
 -define(TUPLE(T), erl_syntax:tuple(T)).
+-define(ABS(T), erl_syntax:abstract(T)).
 -define(APP(F, A), erl_syntax:application(none, ?ATOM(F), A)).
 -define(APP(M, F, A), erl_syntax:application(?ATOM(M), ?ATOM(F), A)).
 -define(BIN(S, L), ?APP(erlang, binary_part, [?TEMPLATE, ?INT(S), ?INT(L)])).

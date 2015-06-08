@@ -21,18 +21,19 @@
 %% THE SOFTWARE.
 
 -module(mustache).
--export([render/2, compile/1, get/2, to_binary/2]).
+-export([render/2, render/3, compile/1, compile/2, get/2, to_binary/2]).
 
 -include("mustache.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -record(state, {
-          path       = []                                 :: [[binary()]],
-          list_index = 1                                  :: pos_integer(),
-          depth      = 0                                  :: non_neg_integer(),
-          ctx        = ?VAR("C", 0, 1)                    :: erl_syntax:synaxTree(),
-          re         = compile_regexp(<<"{{">>, <<"}}">>) :: re:mp(),
-          ix         = 0                                  :: non_neg_integer()
+          path       = []              :: [[binary()]],
+          list_index = 1               :: pos_integer(),
+          depth      = 0               :: non_neg_integer(),
+          ctx        = ?VAR("C", 0, 1) :: erl_syntax:synaxTree(),
+          re                           :: re:mp(),
+          delimiters                   :: {binary(), binary()},
+          ix         = 0               :: non_neg_integer()
          }).
 
 get([], [Item | _Contexts]) -> {ok, Item};
@@ -72,38 +73,52 @@ escape([], Acc)          -> unicode:characters_to_binary(lists:reverse(Acc));
 escape([$< | Rest], Acc) -> escape(Rest, [<<"&lt;">> | Acc]);
 escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
 escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
-escape([C  | Rest], Acc)  -> escape(Rest, [C | Acc]).
+escape([$" | Rest], Acc) -> escape(Rest, [<<"&quot;">> | Acc]);
+escape([C  | Rest], Acc) -> escape(Rest, [C | Acc]).
 
 render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
     Render = compile(Template),
-    Render(Ctx);
+    Render([Ctx]);
+render(Template, Ctxs) when is_list(Ctxs) ->
+    Render = compile(Template),
+    Render(Ctxs);
 render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
-    Render(Ctx).
+    Render([Ctx]);
+render(Render, Ctxs) when is_function(Render, 1), is_list(Ctxs) ->
+    Render(Ctxs).
+
+render(Template, Delimiters, Ctx) when is_map(Ctx) ->
+    render(Template, Delimiters, [Ctx]);
+render(Template, Delimiters, Ctxs) when is_binary(Template), is_list(Ctxs) ->
+    Render = compile(Template, Delimiters),
+    Render(Ctxs).
 
 compile(Template) when is_list(Template) ->
     compile(unicode:characters_to_binary(Template));
 compile(Template) when is_binary(Template) ->
-    State = #state{},
-    Arg = ?VAR('C'),
-    Match = ?MATCH(State#state.ctx, ?LIST([Arg])),
-    Body = ?APP(erlang, iolist_to_binary, compile(Template, State, [])),
-    FunST = ?FUN([?CLAUSE([Arg], [?APP(is_map, [Arg])], [Match, Body])]),
+    compile(Template, {<<"{{">>, <<"}}">>}).
+
+compile(Template, {Left, Right} = Delimiters)
+  when is_binary(Template), is_binary(Left), is_binary(Right) ->
+    State = set_delimiters(Delimiters, #state{}),
+    Body = ?APP(erlang, iolist_to_binary, do_compile(Template, State, [])),
+    FunST = ?FUN([?CLAUSE([State#state.ctx], [], [Body])]),
     FunExpr = erl_syntax:revert(FunST),
     Bindings0 = erl_eval:new_bindings(),
     Bindings1 = erl_eval:add_binding('T', Template, Bindings0),
     {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings1),
     Render.
 
-compile(<<>>, #state{path = []}, Acc) ->
+do_compile(<<>>, #state{path = []}, Acc) ->
   [?LIST(lists:reverse(Acc))];
-compile(Rest, State0, Acc0) ->
+do_compile(Rest, State0, Acc0) ->
     #state{ix = Ix0, re = Re0, ctx = Ctx0, path = Path, depth = Depth,
            list_index = ListIx} = State0,
     case re:run(Rest, Re0) of
         nomatch ->
             Size = byte_size(Rest),
             State1 = State0#state{ix = Ix0 + Size},
-            compile(<<>>, State1, [?BIN(Ix0, Size) | Acc0]);
+            do_compile(<<>>, State1, [?BIN(Ix0, Size) | Acc0]);
         {match, Match} ->
             {PrefixLength, Tag, Back, Total} = split(Rest, Match),
             #state{ix = Ix1} = State1 = State0#state{ix = Ix0 + Total},
@@ -114,7 +129,7 @@ compile(Rest, State0, Acc0) ->
             case Tag of
                 {tag, Escaped, Key} ->
                     Acc2 = [?TOBIN(?GET(Key, Ctx0), Escaped) | Acc1],
-                    compile(Back, State1, Acc2);
+                    do_compile(Back, State1, Acc2);
                 {section, Inverted, Key} ->
                     Next = Depth + 1,
                     InnerState = State1#state{
@@ -123,32 +138,30 @@ compile(Rest, State0, Acc0) ->
                                    ctx        = ?VAR("C", Next, ListIx),
                                    list_index = 1
                                   },
-                    {Inner, End, Rest1, Ix2} = compile(Back, InnerState, []),
+                    {Inner, End, Rest1, Ix2} = do_compile(Back, InnerState, []),
                     Size = End - Ix1,
                     State2 = State1#state{ix = Ix2, list_index = ListIx + 1},
                     Section = case Inverted of
-                                  false ->
-                                      Binary = ?BIN(Ix1, Size),
-                                      compile_section(Key, Ctx0, Depth, ListIx, Inner, Binary);
-                                  true ->
-                                      compile_inverted_section(Key, Ctx0, Depth, ListIx, Inner)
+                                  false -> compile_section(Key, Inner, ?BIN(Ix1, Size), State0);
+                                  true  -> compile_inverted_section(Key, Inner, State0)
                               end,
-                    compile(Rest1, State2, [Section | Acc1]);
+                    do_compile(Rest1, State2, [Section | Acc1]);
                 {end_section, Key} when hd(Path) =:= Key ->
                     {?LIST(lists:reverse(Acc1)), Ix0 + PrefixLength, Back, Ix1};
                 {delimiters, Left, Right} ->
-                    State2 = State1#state{re = compile_regexp(Left, Right)},
-                    compile(Back, State2, Acc1);
+                    State2 = set_delimiters({Left, Right}, State1),
+                    do_compile(Back, State2, Acc1);
                 {comment, _Comment} ->
-                    compile(Back, State1, Acc1)
+                    do_compile(Back, State1, Acc1)
             end
     end.
 
-compile_section(Key, Ctx0, Depth, ListIx, Inner0, Binary) ->
+compile_section(Key, Inner0, Binary, State) ->
+    #state{ctx = Ctx0, depth = Depth, list_index = ListIx, delimiters = Delimiters} = State,
     {Var, Val} = {?VAR("V", Depth, ListIx), ?VAR("Val", Depth, ListIx)},
     Ctx1 = ?VAR("C", Depth + 1, ListIx),
     Inner1 = ?BLOCK([?MATCH(Ctx1, ?LIST([Var], Ctx0)), Inner0]),
-    RenderArgs = [?APP(apply, [Var, ?LIST([Binary])]), ?APP(hd, [Ctx0])],
+    RenderArgs = [?APP(apply, [Var, ?LIST([Binary])]), ?ABS(Delimiters), Ctx0],
     Function = ?APP(?MODULE, render, RenderArgs),
     Clauses = [
                ?CLAUSE([?WILD], false_guard(Val), [?NIL]),
@@ -167,7 +180,8 @@ compile_section(Key, Ctx0, Depth, ListIx, Inner0, Binary) ->
       ]
      ).
 
-compile_inverted_section(Key, Ctx0, Depth, ListIx, Inner0) ->
+compile_inverted_section(Key, Inner0, State) ->
+    #state{ctx = Ctx0, depth = Depth, list_index = ListIx} = State,
     Ctx1 = ?VAR("C", Depth + 1, ListIx),
     Val = ?VAR("Val", Depth, ListIx),
     Inner1 = [?MATCH(Ctx1, Ctx0), Inner0],
@@ -180,11 +194,9 @@ compile_inverted_section(Key, Ctx0, Depth, ListIx, Inner0) ->
       ]
      ).
 
-false_guard(Var) ->
-    ?DISJUNCTION([?EQUAL(Var, ?ATOM(false)), ?EQUAL(Var, ?NIL)]).
+false_guard(Var) -> ?DISJUNCTION([?EQUAL(Var, ?ATOM(false)), ?EQUAL(Var, ?NIL)]).
 
-split(Template, Match) ->
-    split_template(Template, fix_match(Match)).
+split(Template, Match) -> split_template(Template, fix_match(Match)).
 
 fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
 fix_match([_, Total, Left, Tag, Right]) -> [Left, Right, {Total, Tag}];
@@ -223,6 +235,12 @@ parse_key(Tag) ->
 matching(${, $}) -> true;
 matching($=, $=) -> true;
 matching(_,  _)  -> false.
+
+set_delimiters({Left, Right} = Delimiters, State) ->
+    State#state{
+      re         = compile_regexp(Left, Right),
+      delimiters = Delimiters
+     }.
 
 compile_regexp(Left0, Right0) ->
     {Left1, Right1} = tag_start_end(Left0, Right0),
