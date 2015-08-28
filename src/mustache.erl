@@ -228,8 +228,9 @@ token($=, Delimiters) ->
     [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
     {delimiters, Left, Right}.
 
-parse_key(Tag) ->
-    Segments = re:split(Tag, <<"\\.">>, [trim, unicode]),
+parse_key(Tag0) ->
+    {match, [Tag1]} = re:run(Tag0, <<"^\\s*(\\S+)\\s*$">>, [{capture, all_but_first, binary}]),
+    Segments = re:split(Tag1, <<"\\.">>, [trim, unicode]),
     ?LIST(lists:map(fun erl_syntax:abstract/1, Segments)).
 
 matching(${, $}) -> true;
