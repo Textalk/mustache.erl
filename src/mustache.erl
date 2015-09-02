@@ -139,7 +139,6 @@ do_compile(<<>>, #state{path = []}, Acc) ->
   [?Q("[_@list]", [{list, lists:reverse(Acc)}])];
 do_compile(Template, State0, Acc0) ->
     #state{index = Index0, regex = Regex0, context = Context} = State0,
-    io:format("TEMPLATE: ~p~nINDEX: ~p~n", [Template, Index0]),
     case re:run(Template, Regex0) of
         %% No more tags in the template, just append the last binary
         nomatch ->
