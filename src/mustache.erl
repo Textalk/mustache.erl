@@ -24,7 +24,12 @@
 -export([render/2, render/3, compile/1, compile/2, get/2, to_binary/2]).
 
 -define(MERL_NO_TRANSFORM, true).
+
+-ifdef(HAS_MERL).
 -include_lib("syntax_tools/include/merl.hrl").
+-else.
+-include_lib("merl/include/merl.hrl").
+-endif.
 
 -record(state, {
           path = []              :: [[binary()]],
