@@ -1,6 +1,6 @@
 {application, mustache,
     [
-        {description, "A mustache template rendering library."
+        {description, "A mustache template rendering library."},
         {vsn, "0.1.0"},
         {id, "git"},
         {registered, []},
