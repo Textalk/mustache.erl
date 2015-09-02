@@ -23,22 +23,27 @@
 -module(mustache).
 -export([render/2, render/3, compile/1, compile/2, get/2, to_binary/2]).
 
--include("mustache.hrl").
--include_lib("eunit/include/eunit.hrl").
+-define(MERL_NO_TRANSFORM, true).
+-include_lib("syntax_tools/include/merl.hrl").
 
 -record(state, {
-          path       = []              :: [[binary()]],
-          list_index = 1               :: pos_integer(),
-          depth      = 0               :: non_neg_integer(),
-          ctx        = ?VAR("C", 0, 1) :: erl_syntax:synaxTree(),
-          re                           :: re:mp(),
-          delimiters                   :: {binary(), binary()},
-          ix         = 0               :: non_neg_integer()
+          path = []              :: [[binary()]],
+          context                :: erl_syntax:synaxTree(),
+          variables = sets:new() :: sets:set(atom()),
+          regex                  :: re:mp(),
+          delimiters             :: {binary(), binary()},
+          index = 0              :: non_neg_integer()
          }).
 
+%% @doc Get a value by key from given contexts.
+%% The Key is a list of binaries. If the empty path is given
+%% then this corresponds to the current context or {{.}} in mustache.
+%% Otherwise the key is a path into a context. The tag {{apa.bepa}}
+%% will be mapped to the key [<<"apa">>, <<"bepa">>].
 get([], [Item | _Contexts]) -> {ok, Item};
 get(Key, Contexts)          -> context_get(Key, Contexts).
 
+%% @doc Get the first value from the given contexts
 context_get(_Path, []) ->
     undefined;
 context_get(Path, [Context | Contexts]) ->
@@ -47,6 +52,7 @@ context_get(Path, [Context | Contexts]) ->
         undefined   -> context_get(Path, Contexts)
     end.
 
+%% @doc Get a value by a path of keys
 get_path([], Value) ->
     {ok, Value};
 get_path([Key | Keys], Map) when is_map(Map) ->
@@ -57,18 +63,23 @@ get_path([Key | Keys], Map) when is_map(Map) ->
 get_path(_Path, _Value) ->
     undefined.
 
+%% @doc Helper function for turning a result from get/2 into a binary.
+%% The second parameter specifies if the resulting binary should be escaped.
 to_binary({ok, Value}, true)   -> escape(to_binary(Value));
 to_binary({ok, Value}, false)  -> to_binary(Value);
 to_binary(undefined, _Escaped) -> <<>>.
 
+%% @doc Turn an erlang term into a binary
 to_binary(Value) when is_integer(Value) -> integer_to_binary(Value);
 to_binary(Value) when is_float(Value)   -> float_to_binary(Value, [{decimals, 2}]);
 to_binary(Value) when is_atom(Value)    -> atom_to_binary(Value, utf8);
 to_binary(Value) when is_binary(Value)  -> Value.
 
+%% @doc Escape a string or binary
 escape(Binary) when is_binary(Binary) -> escape(unicode:characters_to_list(Binary));
 escape(String) when is_list(String)   -> escape(String, []).
 
+%% @doc Escape a string
 escape([], Acc)          -> unicode:characters_to_binary(lists:reverse(Acc));
 escape([$< | Rest], Acc) -> escape(Rest, [<<"&lt;">> | Acc]);
 escape([$> | Rest], Acc) -> escape(Rest, [<<"&gt;">> | Acc]);
@@ -76,6 +87,7 @@ escape([$& | Rest], Acc) -> escape(Rest, [<<"&amp;">> | Acc]);
 escape([$" | Rest], Acc) -> escape(Rest, [<<"&quot;">> | Acc]);
 escape([C  | Rest], Acc) -> escape(Rest, [C | Acc]).
 
+%% @doc Render a template using given context.
 render(Template, Ctx) when is_binary(Template), is_map(Ctx) ->
     Render = compile(Template),
     Render([Ctx]);
@@ -87,115 +99,194 @@ render(Render, Ctx) when is_function(Render, 1), is_map(Ctx) ->
 render(Render, Ctxs) when is_function(Render, 1), is_list(Ctxs) ->
     Render(Ctxs).
 
+%% @doc Render a template using given delimiters and context.
 render(Template, Delimiters, Ctx) when is_map(Ctx) ->
     render(Template, Delimiters, [Ctx]);
 render(Template, Delimiters, Ctxs) when is_binary(Template), is_list(Ctxs) ->
     Render = compile(Template, Delimiters),
     Render(Ctxs).
 
+%% @doc Compile a template to a function.
 compile(Template) when is_list(Template) ->
     compile(unicode:characters_to_binary(Template));
 compile(Template) when is_binary(Template) ->
     compile(Template, {<<"{{">>, <<"}}">>}).
 
+%% @doc Compile a template to a function using given delimiters.
 compile(Template, {Left, Right} = Delimiters)
   when is_binary(Template), is_binary(Left), is_binary(Right) ->
-    State = set_delimiters(Delimiters, #state{}),
-    Body = ?APP(erlang, iolist_to_binary, do_compile(Template, State, [])),
-    FunST = ?FUN([?CLAUSE([State#state.ctx], [], [Body])]),
-    FunExpr = erl_syntax:revert(FunST),
-    Bindings0 = erl_eval:new_bindings(),
-    Bindings1 = erl_eval:add_binding('T', Template, Bindings0),
-    {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings1),
+    State0 = set_delimiters(Delimiters, #state{}),
+    {Context, State1} = new_variable(State0),
+    State2 = State1#state{context = Context},
+    FunTree = ?Q(
+                "fun (_@context) ->\n"
+                "   iolist_to_binary(_@body)\n"
+                "end",
+                [{context, merl:var(Context)},
+                 {body, do_compile(Template, State2, [])}]
+               ),
+    merl:print(FunTree),
+    FunExpr = erl_syntax:revert(FunTree),
+    Bindings = erl_eval:add_binding('Template', Template, erl_eval:new_bindings()),
+    {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings),
     Render.
 
 do_compile(<<>>, #state{path = []}, Acc) ->
-  [?LIST(lists:reverse(Acc))];
-do_compile(Rest, State0, Acc0) ->
-    #state{ix = Ix0, re = Re0, ctx = Ctx0, path = Path, depth = Depth,
-           list_index = ListIx} = State0,
-    case re:run(Rest, Re0) of
+  [?Q("[_@list]", [{list, lists:reverse(Acc)}])];
+do_compile(Template, State0, Acc0) ->
+    #state{index = Index0, regex = Regex0, context = Context} = State0,
+    io:format("TEMPLATE: ~p~nINDEX: ~p~n", [Template, Index0]),
+    case re:run(Template, Regex0) of
+        %% No more tags in the template, just append the last binary
         nomatch ->
-            Size = byte_size(Rest),
-            State1 = State0#state{ix = Ix0 + Size},
-            do_compile(<<>>, State1, [?BIN(Ix0, Size) | Acc0]);
+            Size = byte_size(Template),
+            State1 = State0#state{index = Index0 + Size},
+            do_compile(<<>>, State1, [template_part(Index0, Size) | Acc0]);
+        %% Otherwise there are tags left
         {match, Match} ->
-            {PrefixLength, Tag, Back, Total} = split(Rest, Match),
-            #state{ix = Ix1} = State1 = State0#state{ix = Ix0 + Total},
+            %% We then split the match we got and parse it to check what tag we got
+            {PrefixLength, Tag, Back, Total} = split(Template, Match),
+
+            %% First we may have a prefix binary before the tag, this we just
+            %% add to the accumulator
             Acc1 = case PrefixLength of
                        0 -> Acc0;
-                       _ -> [?BIN(Ix0, PrefixLength) | Acc0]
+                       _ -> [template_part(Index0, PrefixLength) | Acc0]
                    end,
+
+            %% Then depending on what tag we found we take appropriate action
+            State1 = State0#state{index = Index0 + Total},
             case Tag of
+                %% If it's a simple tag thats just compiled into a to_binary-wrapped get call
                 {tag, Escaped, Key} ->
-                    Acc2 = [?TOBIN(?GET(Key, Ctx0), Escaped) | Acc1],
-                    do_compile(Back, State1, Acc2);
-                {section, Inverted, Key} ->
-                    Next = Depth + 1,
-                    InnerState = State1#state{
-                                   depth      = Next,
-                                   path       = [Key | Path],
-                                   ctx        = ?VAR("C", Next, ListIx),
-                                   list_index = 1
-                                  },
-                    {Inner, End, Rest1, Ix2} = do_compile(Back, InnerState, []),
-                    Size = End - Ix1,
-                    State2 = State1#state{ix = Ix2, list_index = ListIx + 1},
-                    Section = case Inverted of
-                                  false -> compile_section(Key, Inner, ?BIN(Ix1, Size), State0);
-                                  true  -> compile_inverted_section(Key, Inner, State0)
-                              end,
-                    do_compile(Rest1, State2, [Section | Acc1]);
-                {end_section, Key} when hd(Path) =:= Key ->
-                    {?LIST(lists:reverse(Acc1)), Ix0 + PrefixLength, Back, Ix1};
+                    Get = ?Q(
+                             "mustache:to_binary(\n"
+                             "    mustache:get(_@key, _@context),\n"
+                             "    _@escaped\n"
+                             ")",
+                             [{key, merl:term(Key)},
+                              {context, merl:var(Context)},
+                              {escaped, merl:term(Escaped)}]
+                            ),
+                    do_compile(Back, State1, [Get | Acc1]);
+                %% If it's the start of a section then we compile the inner part of the section
+                %% before we compile the section itself
+                {section, Inverted, Key}  ->
+                    {Section, Rest, State2} = case Inverted of
+                                                      true  -> compile_inverted_section(Key, Back, State1);
+                                                      false -> compile_section(Key, Back, State1)
+                                                  end,
+                    do_compile(Rest, State2, [Section | Acc1]);
+                %% If we encounter a section terminating tag then we just return the accumulator
+                {end_section, Key} when hd(State0#state.path) =:= Key ->
+                    SectionEnd = Index0 + PrefixLength,
+                    {?Q("[_@list]", [{list, lists:reverse(Acc1)}]), SectionEnd, Back, State1};
+                %% If we encounter a switch in delimiters then we need to parse the rest of the template
+                %% using them
                 {delimiters, Left, Right} ->
-                    State2 = set_delimiters({Left, Right}, State1),
-                    do_compile(Back, State2, Acc1);
+                    do_compile(Back, set_delimiters({Left, Right}, State1), Acc1);
+                %% Otherwise it's a comment which we just throw away
                 {comment, _Comment} ->
                     do_compile(Back, State1, Acc1)
             end
     end.
 
-compile_section(Key, Inner0, Binary, State) ->
-    #state{ctx = Ctx0, depth = Depth, list_index = ListIx, delimiters = Delimiters} = State,
-    {Var, Val} = {?VAR("V", Depth, ListIx), ?VAR("Val", Depth, ListIx)},
-    Ctx1 = ?VAR("C", Depth + 1, ListIx),
-    Inner1 = ?BLOCK([?MATCH(Ctx1, ?LIST([Var], Ctx0)), Inner0]),
-    RenderArgs = [?APP(apply, [Var, ?LIST([Binary])]), ?ABS(Delimiters), Ctx0],
-    Function = ?APP(?MODULE, render, RenderArgs),
-    Clauses = [
-               ?CLAUSE([?WILD], false_guard(Val), [?NIL]),
-               ?CLAUSE(
-                  [?WILD],
-                  [?APP(is_list, [Val])],
-                  [?LISTCOMP(Inner1, [?GEN(Var, Val)])]
-                 ),
-               ?CLAUSE([Var], [?APP(is_function, [Var, ?INT(1)])], [Function]),
-               ?CLAUSE([Var], [], [Inner1])
-              ],
-    ?CASE(?GET(Key, Ctx0),
-      [
-       ?CLAUSE([?ATOM(undefined)], [], [?NIL]),
-       ?CLAUSE([?TUPLE([?ATOM(ok), Val])], [], [?CASE(Val, Clauses)])
-      ]
-     ).
+%% @doc Compile a section.
+%% We are given a compiled inner part and we need to construct the case-expressions to decide what
+%% will happen in the different cases of which contexts
+compile_section(Key, Template, State0) ->
+    #state{context = Context, delimiters = Delimiters} = State0,
+    {Value, State1} = new_variable(State0),
+    {Variable, State2} = new_variable(State1),
+    NextContextExpr = ?Q(
+                         "[_@variable | _@context]",
+                         [{variable, merl:var(Variable)}, {context, merl:var(Context)}]
+                        ),
+    {Inner, SectionPos, Rest, State3} = compile_inner_section(Key, NextContextExpr, Template, State2),
+    {SectionStart, SectionSize} = SectionPos,
+    Section = ?Q(
+                 "case mustache:get(_@key, _@context) of\n"
+                 "    undefined ->\n"
+                 "        <<>>;\n"
+                 "    {ok, _@value} ->\n"
+                 "        case _@value of\n"
+                 "            false ->\n"
+                 "                <<>>;\n"
+                 "            _ when is_list(_@value) ->\n"
+                 "                [_@inner || _@variable <- _@value];\n"
+                 "            _ when is_function(_@value, 1) ->\n"
+                 "                mustache:render(apply(_@value, [_@binary]), _@delimiters, _@context);\n"
+                 "            _@variable ->\n"
+                 "                _@inner\n"
+                 "        end\n"
+                 "end",
+                 [{key, merl:term(Key)},
+                  {context, merl:var(Context)},
+                  {value, merl:var(Value)},
+                  {variable, merl:var(Variable)},
+                  {binary, template_part(SectionStart, SectionSize)},
+                  {delimiters, merl:term(Delimiters)},
+                  {inner, Inner}]
+                ),
+    {Section, Rest, State3}.
 
-compile_inverted_section(Key, Inner0, State) ->
-    #state{ctx = Ctx0, depth = Depth, list_index = ListIx} = State,
-    Ctx1 = ?VAR("C", Depth + 1, ListIx),
-    Val = ?VAR("Val", Depth, ListIx),
-    Inner1 = [?MATCH(Ctx1, Ctx0), Inner0],
-    ?CASE(
-      ?GET(Key, Ctx0),
-      [
-       ?CLAUSE([?ATOM(undefined)], [], Inner1),
-       ?CLAUSE([?TUPLE([?ATOM(ok), Val])], false_guard(Val), Inner1),
-       ?CLAUSE([?WILD], [], [?NIL])
-      ]
-     ).
+%% @doc Compile an inverted section.
+%% The inner compiled section will only be included if the value does not exist or
+%% if the value is falsy.
+%% Falsy values are: false, <<>> and [].
+compile_inverted_section(Key, Template, #state{context = Context} = State0) ->
+    NextContextExpr = merl:var(Context),
+    {Inner, _SectionPos, Rest, State1} = compile_inner_section(Key, NextContextExpr, Template, State0),
+    Section = ?Q(
+                 "case mustache:get(_@key, _@context) of\n"
+                 "    undefined   -> _@inner;\n"
+                 "    {ok, false} -> _@inner;\n"
+                 "    {ok, <<>>}  -> _@inner;\n"
+                 "    {ok, []}    -> _@inner;\n"
+                 "    _           -> <<>>\n"
+                 "end",
+                 [{key, merl:term(Key)},
+                  {context, merl:var(Context)},
+                  {inner, Inner}]
+                ),
+    {Section, Rest, State1}.
 
-false_guard(Var) -> ?DISJUNCTION([?EQUAL(Var, ?ATOM(false)), ?EQUAL(Var, ?NIL)]).
+%% @doc Compile the inner part of a section.
+%% We pass as an argument what expression the next context should be set to, this is needed to
+%% pass information down from the outer part of the section.
+compile_inner_section(Key, NextContextExpr, Template, State0) ->
+    #state{context = Context, index = SectionStart, path = Path} = State0,
+    {NextContext, State1} = new_variable(State0),
+    State2 = State1#state{
+               path    = [Key | Path],
+               context = NextContext
+              },
+    {Inner0, SectionEnd, Rest, State3} = do_compile(Template, State2, []),
+    SectionSize = SectionEnd - SectionStart,
+    Inner1 = ?Q(
+               "begin\n"
+               "   _@next_context = _@next_context_expr,\n"
+               "   _@inner\n"
+               "end",
+               [{next_context, merl:var(NextContext)},
+                {next_context_expr, NextContextExpr},
+                {inner, Inner0}]
+              ),
+    {Inner1, {SectionStart, SectionSize}, Rest, State3#state{context = Context, path = Path}}.
 
+%% @doc Get a variable name
+new_variable(#state{variables = Variables} = State) ->
+    Variable = erl_syntax_lib:new_variable_name(Variables),
+    {Variable, State#state{variables = sets:add_element(Variable, Variables)}}.
+
+%% @doc Create a reference to the original template
+template_part(Index, Size) ->
+    ?Q(
+       "erlang:binary_part(Template, _@index, _@size)",
+       [{index, merl:term(Index)}, {size, merl:term(Size)}]
+      ).
+
+%% @doc Given a tag match, split the template into parts
 split(Template, Match) -> split_template(Template, fix_match(Match)).
 
 fix_match([_, {-1, 0}, _, _, _ | Rest]) -> fix_match(Rest);
@@ -217,6 +308,7 @@ split_template(Template, [Type, {{Start, Size}, {TagStart, TagSize}}]) ->
     Token = token(Type, Tag),
     {Start, Token, Back, BackStart}.
 
+%% @doc Create a token depending on the tag modifier
 token(none, Tag) -> {tag, true, parse_key(Tag)};
 token($#, Tag) -> {section, false, parse_key(Tag)};
 token($^, Tag) -> {section, true, parse_key(Tag)};
@@ -228,21 +320,27 @@ token($=, Delimiters) ->
     [Left, Right] = re:split(Delimiters, <<" ">>, [unicode]),
     {delimiters, Left, Right}.
 
+%% @doc Parse a key.
+%% - Strip the binary from prefix and suffix whitespace
+%% - Split the key on dots
+%% - Construct the AST for the key
 parse_key(Tag0) ->
     {match, [Tag1]} = re:run(Tag0, <<"^\\s*(\\S+)\\s*$">>, [{capture, all_but_first, binary}]),
-    Segments = re:split(Tag1, <<"\\.">>, [trim, unicode]),
-    ?LIST(lists:map(fun erl_syntax:abstract/1, Segments)).
+    re:split(Tag1, <<"\\.">>, [trim, unicode]).
 
+%% @doc Function to assert that modifiers match
 matching(${, $}) -> true;
 matching($=, $=) -> true;
 matching(_,  _)  -> false.
 
+%% @doc Change the delimiters in the state
 set_delimiters({Left, Right} = Delimiters, State) ->
     State#state{
-      re         = compile_regexp(Left, Right),
+      regex      = compile_regexp(Left, Right),
       delimiters = Delimiters
      }.
 
+%% @doc Compile a new regexp for the given delimiters
 compile_regexp(Left0, Right0) ->
     {Left1, Right1} = tag_start_end(Left0, Right0),
     TagRE = ["(", Left1, "({|=)(.+?)(}|=)", Right1, ")"
