@@ -1,13 +1,15 @@
 {application, mustache,
     [
-        {description, "Mustache Templates Rendering Library"},
+        {description, "A mustache template rendering library."
         {vsn, "0.1.0"},
+        {id, "git"},
         {registered, []},
         {applications, [
                 kernel,
                 stdlib,
                 merl
-            ]},
+        ]},
         {modules, []},
         {env, []}
-    ]}.
+    ]
+}.
