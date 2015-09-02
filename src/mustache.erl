@@ -125,7 +125,6 @@ compile(Template, {Left, Right} = Delimiters)
                 [{context, merl:var(Context)},
                  {body, do_compile(Template, State2, [])}]
                ),
-    merl:print(FunTree),
     FunExpr = erl_syntax:revert(FunTree),
     Bindings = erl_eval:add_binding('Template', Template, erl_eval:new_bindings()),
     {value, Render, _Bindings} = erl_eval:expr(FunExpr, Bindings),
