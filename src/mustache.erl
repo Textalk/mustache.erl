@@ -25,11 +25,7 @@
 
 -define(MERL_NO_TRANSFORM, true).
 
--ifdef(HAS_MERL).
--include_lib("syntax_tools/include/merl.hrl").
--else.
 -include_lib("merl/include/merl.hrl").
--endif.
 
 -record(state, {
           path = []              :: [[binary()]],
